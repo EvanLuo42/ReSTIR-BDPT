@@ -1,21 +1,16 @@
 #ifndef LRM_SLANG
 #define LRM_SLANG
 
+import PathReservoir;
+
 #define LRM_NUM_BUCKETS 100000u
 #define LRM_BUCKET_ENTRIES 32u
 #define LRM_CELL_ENTRY_COUNT (LRM_NUM_BUCKETS * LRM_BUCKET_ENTRIES)
 
 struct LRMRecord
 {
-    float3 pos;
-    float3 normal;
-    float3 pathF;
-    float prefixPdf;
-
+    PathReservoir reservoir;
     uint pixelIndex;
-    uint subpathSeed;
-    uint bounce;
-    uint pad0;
 };
 
 struct LRMTriplet
@@ -32,6 +27,7 @@ cbuffer LRMLimitsCB
     uint gLRMMaxTriplets;
     uint gLRMMaxCellStorage;
     uint gLRMMaxPerCell;
+    float gCellSize;
 }
 
 RWStructuredBuffer<LRMRecord> gLRMRecords;
@@ -90,30 +86,61 @@ uint LRM_FindOrInsertCell(float3 posW, float cellSize)
     return 0xFFFFFFFFu;
 }
 
-void LRM_Insert(float3 pos, float3 normal, float3 pathF, float prefixPdf, uint pixelIndex, uint subpathSeed, uint bounce, float cellSize)
+void LRM_InsertReservoir(uint pixelIndex, PathReservoir r)
 {
     uint recordId;
     InterlockedAdd(gLRMRecordCount[0], 1, recordId);
+
     if (recordId >= gLRMMaxRecords)
         return;
 
-    gLRMRecords[recordId] = { pos, normal, pathF, prefixPdf, pixelIndex, subpathSeed, bounce, 0 };
+    gLRMRecords[recordId].reservoir = r;
+    gLRMRecords[recordId].pixelIndex = pixelIndex;
 
-    uint cellEntryId = LRM_FindOrInsertCell(pos, cellSize);
+    uint cellEntryId = LRM_FindOrInsertCell(r.xr.pos, gCellSize);
     if (cellEntryId == 0xFFFFFFFFu)
         return;
 
     uint localIndex;
     InterlockedAdd(gLRMCellCount[cellEntryId], 1, localIndex);
+
     if (localIndex >= gLRMMaxPerCell)
+    {
+        InterlockedAdd(gLRMCellCount[cellEntryId], -1);
         return;
+    }
 
     uint tripletId;
     InterlockedAdd(gLRMTripletCount[0], 1, tripletId);
+
     if (tripletId >= gLRMMaxTriplets)
         return;
 
     gLRMTriplets[tripletId] = LRMTriplet(recordId, cellEntryId, localIndex, 0);
+}
+
+uint LRM_ComputeCellIndex(float3 posW, float cellSize)
+{
+    int3 p = (int3)floor(posW / cellSize);
+
+    uint key = lrm_pcg(asuint(cellSize));
+    key = lrm_pcg(key ^ (uint)p.x);
+    key = lrm_pcg(key ^ (uint)p.y);
+    key = lrm_pcg(key ^ (uint)p.z);
+
+    uint bucket = lrm_pcg(key) % LRM_NUM_BUCKETS;
+    uint checksum = max(lrm_mix(key), 1u);
+
+    [unroll]
+    for (uint i = 0; i < LRM_BUCKET_ENTRIES; ++i)
+    {
+        uint idx = bucket * LRM_BUCKET_ENTRIES + i;
+
+        if (gLRMCellChecksum[idx] == checksum)
+            return idx;
+    }
+
+    return 0xFFFFFFFFu;
 }
 
 #endif

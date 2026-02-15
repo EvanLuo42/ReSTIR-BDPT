@@ -8,6 +8,7 @@ import Utils.Sampling.SampleGenerator;
 import Scene.Raytracing;
 import Rendering.Lights.EmissiveLightSamplerHelpers;
 import Utils.Math.MathHelpers;
+import LightUtils;
 
 #include "LRM.slangh"
 
@@ -17,70 +18,13 @@ cbuffer LightSubpathCB
     uint gMaxBounces;
     uint gFrameCount;
     uint2 gRenderTargetDim;
-    float gCellSize;
 }
-
-cbuffer EmissivePowerCB
-{
-    float gInvWeightsSum; // 1 / totalFlux
-}
-
-Buffer<uint2> gTriangleAliasTable;
 
 RWStructuredBuffer<LightSubpathVertex> gLightVertexCache;
 
-uint sampleEmissiveTriangle(inout SampleGenerator sg, out float selectionPdf)
-{
-    uint triangleCount = gScene.lightCollection.triangleCount;
+RWStructuredBuffer<uint> gLightVertexCounter;
 
-    float uLight = sampleNext1D(sg);
-    uint tableIndex = min((uint)(uLight * triangleCount), triangleCount - 1);
-
-    uint2 packed = gTriangleAliasTable[tableIndex];
-    float threshold = f16tof32(packed.x >> 16u);
-    uint selectAbove = ((packed.x & 0xFFFFu) << 8u) | ((packed.y >> 24u) & 0xFFu);
-    uint selectBelow = packed.y & 0xFFFFFFu;
-
-    uint triIdx = (sampleNext1D(sg) >= threshold) ? selectAbove : selectBelow;
-
-    selectionPdf = gScene.lightCollection.fluxData[triIdx].flux * gInvWeightsSum;
-    return triIdx;
-}
-
-void initializeLightPath(
-    inout SampleGenerator sg,
-    out SceneVertex y0,
-    out float3 y0PosW,
-    out float3 y0NgW,
-    out float3 y0NsW,
-    out float3 Le,
-    out float pA_y0
-)
-{
-    float selectionPdf;
-    uint triIdx = sampleEmissiveTriangle(sg, selectionPdf);
-
-    EmissiveTriangle tri = gScene.lightCollection.getTriangle(triIdx);
-    MeshLightData meshData = gScene.lightCollection.meshData[tri.lightIdx];
-
-    float3 bary = sample_triangle(sampleNext2D(sg));
-
-    y0.instanceID = meshData.instanceID;
-    y0.primitiveID = triIdx - meshData.triangleOffset;
-    y0.bary = bary.yz;
-
-    y0PosW = tri.getPosition(bary);
-    y0NgW = tri.normal;
-
-    y0NsW = tri.normal;
-
-    float2 uv = tri.getTexCoord(bary);
-    Le = gScene.materials.evalEmissive(tri.materialID, uv);
-
-    pA_y0 = selectionPdf / tri.area;
-}
-
-bool traceNewVertex(inout SampleGenerator sg, inout float3 rayOrigin, inout float3 rayDir, inout LightSubpathVertex v, out bool isRough)
+bool TraceNewLightVertex(inout SampleGenerator sg, inout float3 rayOrigin, inout float3 rayDir, inout LightSubpathVertex v, out bool isRough)
 {
     SceneRayQuery<0> rq;
     Ray ray = Ray(rayOrigin, rayDir, 1e-4f, 1e38f);
@@ -122,7 +66,40 @@ bool traceNewVertex(inout SampleGenerator sg, inout float3 rayOrigin, inout floa
     return true;
 }
 
-bool connectToCamera(LightSubpathVertex v, out PathReservoir r, out uint pixelIndex)
+void InitializeLightPath(
+    inout SampleGenerator sg,
+    out SceneVertex y0,
+    out float3 y0PosW,
+    out float3 y0NgW,
+    out float3 y0NsW,
+    out float3 Le,
+    out float pA_y0
+)
+{
+    float selectionPdf;
+    uint triIdx = SampleEmissiveTriangle(sg, selectionPdf);
+
+    EmissiveTriangle tri = gScene.lightCollection.getTriangle(triIdx);
+    MeshLightData meshData = gScene.lightCollection.meshData[tri.lightIdx];
+
+    float3 bary = sample_triangle(sampleNext2D(sg));
+
+    y0.instanceID = meshData.instanceID;
+    y0.primitiveID = triIdx - meshData.triangleOffset;
+    y0.bary = bary.yz;
+
+    y0PosW = tri.getPosition(bary);
+    y0NgW = tri.normal;
+
+    y0NsW = tri.normal;
+
+    float2 uv = tri.getTexCoord(bary);
+    Le = gScene.materials.evalEmissive(tri.materialID, uv);
+
+    pA_y0 = selectionPdf / tri.area;
+}
+
+bool ConnectToCamera(LightSubpathVertex v, out PathReservoir r, out uint pixelIndex)
 {
     float3 x = v.y_s1.pos;
 
@@ -157,6 +134,20 @@ bool connectToCamera(LightSubpathVertex v, out PathReservoir r, out uint pixelIn
     r.pathF = contrib;
     r.prefixPdf = v.subpathPdf;
 
+    r.xr = v.y_s1;
+    r.y0 = v.y0;
+
+    r.lightPathSeed = v.subpathSeed;
+    r.lightPathId = v.subpathId;
+
+    r.lightPathPdf = v.subpathPdf;
+    r.lightPathVertices = v.numVertices;
+
+    r.reconnectionCos = cosTheta;
+    r.reconnectionDist = dist;
+
+    r.UCW = length(contrib);
+
     return true;
 }
 
@@ -172,7 +163,7 @@ void main(uint3 tid: SV_DispatchThreadID)
     SceneVertex y0 = {};
     float3 y0PosW, y0NgW, y0NsW, Le;
     float pA_y0;
-    initializeLightPath(sg, y0, y0PosW, y0NgW, y0NsW, Le, pA_y0);
+    InitializeLightPath(sg, y0, y0PosW, y0NgW, y0NsW, Le, pA_y0);
 
     LightSubpathVertex yj = {};
     yj.y0 = y0;
@@ -203,28 +194,24 @@ void main(uint3 tid: SV_DispatchThreadID)
     for (uint j = 1; j < gMaxBounces; ++j)
     {
         bool isRough = false;
-        bool alive = traceNewVertex(sg, rayOrigin, rayDir, yj, isRough);
+        bool alive = TraceNewLightVertex(sg, rayOrigin, rayDir, yj, isRough);
         if (!alive)
             break;
 
         if (isRough)
         {
-            gLightVertexCache[(i + 1) * j] = yj;
+            uint idx;
+            InterlockedAdd(gLightVertexCounter[0], 1, idx);
+
+            gLightVertexCache[idx] = yj;
+            yj.subpathId = idx;
+
             PathReservoir r;
             uint k;
 
-            if (connectToCamera(yj, r, k))
+            if (ConnectToCamera(yj, r, k))
             {
-                LRM_Insert(
-                    yj.y_s1.pos,
-                    yj.y_s1.normal,
-                    r.pathF,
-                    r.prefixPdf,
-                    k,
-                    yj.subpathSeed,
-                    yj.numBounces,
-                    gCellSize
-                );
+                LRM_InsertReservoir(k, r);
             }
         }
     }
