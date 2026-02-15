@@ -3,3 +3,8 @@
 # Format slang files as HLSL.
 *.slang gitlab-language=hlsl
 *.slangh gitlab-language=hlsl
+
+*.h  text eol=lf
+*.cpp text eol=lf
+*.slang text eol=lf
+*.cmake text eol=lf

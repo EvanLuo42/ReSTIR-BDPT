@@ -94,7 +94,10 @@
             "displayName": "Windows Ninja/MSVC",
             "inherits": [
                 "windows-ninja-msvc-base"
-            ]
+            ],
+            "cacheVariables": {
+                "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+            }
         },
         {
             "name": "windows-ninja-msvc-ci",
