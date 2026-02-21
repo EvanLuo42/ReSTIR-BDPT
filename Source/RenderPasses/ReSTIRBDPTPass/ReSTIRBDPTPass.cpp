@@ -27,39 +27,92 @@
  **************************************************************************/
 #include "ReSTIRBDPTPass.h"
 
-#include <cstdint>
 #include <memory>
 #include <utility>
-#include <vector>
-#include "Utils/Sampling/AliasTable.h"
+#include "Core/API/Buffer.h"
+#include "RenderGraph/RenderPassHelpers.h"
+#include "Rendering/Lights/EmissivePowerSampler.h"
+#include "Utils/Properties.h"
+#include "RenderGraph/RenderPassStandardFlags.h"
 
 extern "C" FALCOR_API_EXPORT void registerPlugin(PluginRegistry& registry)
 {
     registry.registerClass<RenderPass, ReSTIRBDPTPass>();
 }
 
-ReSTIRBDPTPass::ReSTIRBDPTPass(ref<Device> pDevice, const Properties& props) : RenderPass(std::move(pDevice)) {}
+namespace
+{
+const char kGenerateLightSubpathsShader[] = "RenderPasses/ReSTIRBDPTPass/GenerateLightSubpaths.cs.slang";
+
+const ChannelList kOutputChannels = {
+    {"color", "gOutputColor", "Output color (sum of direct and indirect)", false, ResourceFormat::RGBA32Float},
+};
+
+const float kRoughnessThreshold = 0.08f;
+
+const char kEnableSpatialReuse[] = "enableSpatialReuse";
+const char kEnableTemperoralReuse[] = "enableTemperoalReuse";
+const char kNumMaxBounces[] = "numMaxBounces";
+} // namespace
+
+ReSTIRBDPTPass::ReSTIRBDPTPass(ref<Device> pDevice, const Properties& props) : RenderPass(std::move(pDevice))
+{
+    parseProperties(props);
+}
+
+void ReSTIRBDPTPass::parseProperties(const Properties& props)
+{
+    for (const auto& [key, value] : props)
+    {
+        if (key == kEnableSpatialReuse)
+            mEnableSpatialReuse = value;
+        else if (key == kEnableTemperoralReuse)
+            mEnableTemporalReuse = value;
+        else if (key == kNumMaxBounces)
+            mNumMaxBounces = value;
+        else
+            logWarning("Unknown property '{}' in ReSTIRBDPTPass properties.", key);
+    }
+}
 
 Properties ReSTIRBDPTPass::getProperties() const
 {
-    return {};
+    Properties props;
+    props[kEnableSpatialReuse] = mEnableSpatialReuse;
+    props[kEnableTemperoralReuse] = mEnableTemporalReuse;
+    props[kNumMaxBounces] = mNumMaxBounces;
+    return props;
 }
 
-void ReSTIRBDPTPass::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene) {}
-
-void ReSTIRBDPTPass::GenerateAliasTable(const ref<Scene>& pScene)
+void ReSTIRBDPTPass::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
 {
-    std::vector<float> weights;
+    mFrameCount = 0;
 
-    for (uint32_t i = 0; i < pScene->getLightCount(); ++i)
+    mpScene = pScene;
+
+    if (!mpScene)
+        return;
+
+    mpSampleGenerator = SampleGenerator::create(mpDevice, SAMPLE_GENERATOR_TINY_UNIFORM);
+    mpEmissivePowerSampler = std::make_unique<EmissivePowerSampler>(pRenderContext, mpScene->getILightCollection(pRenderContext));
+
+    DefineList defines = mpScene->getSceneDefines();
+    defines.add(mpSampleGenerator->getDefines());
+    defines.add(mpEmissivePowerSampler->getDefines());
+
     {
-        auto light = pScene->getLight(i);
-        weights.push_back(light->getPower());
+        ProgramDesc desc;
+        desc.addShaderModules(mpScene->getShaderModules());
+        desc.addTypeConformances(mpScene->getTypeConformances());
+        desc.addShaderLibrary(kGenerateLightSubpathsShader).csEntry("main");
+        mpGenerateLightSubpathsPass = ComputePass::create(mpDevice, desc, defines, true);
     }
 
-    std::random_device rd;
-    std::mt19937 rng(rd());
-    mpAliasTable = std::make_unique<AliasTable>(mpDevice, weights, rng);
+    mpLRM = LightReservoirMap::create(mpDevice, mpScene, mFrameDim, mNumLightSubpaths);
+
+    mpDebugCounter = mpDevice->createStructuredBuffer(
+        sizeof(uint32_t), 1, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess, MemoryType::DeviceLocal, nullptr, false
+    );
 }
 
 RenderPassReflection ReSTIRBDPTPass::reflect(const CompileData& compileData)
@@ -75,8 +128,86 @@ void ReSTIRBDPTPass::compile(RenderContext* pRenderContext, const CompileData& c
 {
     mFrameDim = compileData.defaultTexDims;
     mNumLightSubpaths = mFrameDim.x * mFrameDim.y;
+
+    uint32_t maxLVCSize = mNumLightSubpaths * mNumMaxBounces;
+
+    mpLVC = mpDevice->createStructuredBuffer(
+        100, maxLVCSize, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess, MemoryType::DeviceLocal, nullptr, true
+    );
+
+    if (mpScene)
+        mpLRM = LightReservoirMap::create(mpDevice, mpScene, mFrameDim, mNumLightSubpaths);
 }
 
-void ReSTIRBDPTPass::execute(RenderContext* pRenderContext, const RenderData& renderData) {}
+void ReSTIRBDPTPass::execute(RenderContext* pRenderContext, const RenderData& renderData)
+{
+    auto& dict = renderData.getDictionary();
+    if (mOptionsChanged)
+    {
+        auto flags = dict.getValue(kRenderPassRefreshFlags, RenderPassRefreshFlags::None);
+        dict[kRenderPassRefreshFlags] = flags | RenderPassRefreshFlags::RenderOptionsChanged;
+        mOptionsChanged = false;
+    }
 
-void ReSTIRBDPTPass::renderUI(Gui::Widgets& widget) {}
+    if (!mpScene)
+    {
+        for (auto it : kOutputChannels)
+        {
+            Texture* pDst = renderData.getTexture(it.name).get();
+            if (pDst)
+                pRenderContext->clearTexture(pDst);
+        }
+        return;
+    }
+
+    mpEmissivePowerSampler->update(pRenderContext, mpScene->getILightCollection(pRenderContext));
+    mpLRM->beginFrame(pRenderContext);
+
+    pRenderContext->clearUAVCounter(mpLVC, 0);
+
+    pRenderContext->clearUAV(mpDebugCounter->getUAV().get(), uint4(0));
+
+    auto var = mpGenerateLightSubpathsPass->getRootVar();
+
+    mpSampleGenerator->bindShaderData(var);
+    mpEmissivePowerSampler->bindShaderData(var["gEmissivePowerSampler"]);
+    mpScene->bindShaderDataForRaytracing(pRenderContext, var["gScene"]);
+
+    var["CB"]["gNumLightSubpaths"] = mNumLightSubpaths;
+    var["CB"]["gNumBounces"] = mNumMaxBounces;
+    var["CB"]["gMISPower"] = 1;
+    var["CB"]["gFrameCount"] = mFrameCount;
+    var["CB"]["gTargetDim"] = mFrameDim;
+    var["CB"]["gRoughnessThreshold"] = kRoughnessThreshold;
+
+    var["gLVC"] = mpLVC;
+    mpLRM->bindShaderData(var["gLRM"]);
+
+    var["gDebugCounter"] = mpDebugCounter;
+
+    uint32_t threadGroups = div_round_up(mNumLightSubpaths, 64u);
+    mpGenerateLightSubpathsPass->execute(pRenderContext, threadGroups, 1, 1);
+
+    mpLRM->executeSort(pRenderContext);
+
+    mFrameCount++;
+}
+
+void ReSTIRBDPTPass::renderUI(Gui::Widgets& widget)
+{
+    bool dirty = false;
+
+    dirty |= widget.var("Max bounces", mNumMaxBounces, 0u, 1u << 16);
+    widget.tooltip("Maximum number of bounces when tracing new vertex.", true);
+
+    dirty |= widget.checkbox("Enable Spatial Reuse", mEnableSpatialReuse);
+    widget.tooltip("Enable spatial reuse.", true);
+
+    dirty |= widget.checkbox("Enable Temperal Reuse", mEnableTemporalReuse);
+    widget.tooltip("Enable temperal reuse", true);
+
+    if (dirty)
+    {
+        mOptionsChanged = true;
+    }
+}

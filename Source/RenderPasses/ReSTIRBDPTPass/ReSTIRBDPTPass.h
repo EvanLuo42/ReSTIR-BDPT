@@ -27,15 +27,17 @@
  **************************************************************************/
 #pragma once
 
-#include <cstddef>
 #include <memory>
 #include "Core/API/Buffer.h"
 #include "Core/Object.h"
 #include "Core/Pass/ComputePass.h"
+#include "LightReservoirMap.h"
 #include "RenderGraph/RenderPass.h"
+#include "Rendering/Lights/EmissiveLightSampler.h"
+#include "Rendering/Lights/EmissivePowerSampler.h"
 #include "Scene/Scene.h"
 #include "Utils/Math/VectorTypes.h"
-#include "Utils/Sampling/AliasTable.h"
+#include "Utils/Properties.h"
 
 using namespace Falcor;
 
@@ -58,20 +60,24 @@ public:
     bool onKeyEvent(const KeyboardEvent& keyEvent) override { return false; }
 
 private:
-    void GenerateAliasTable(const ref<Scene>& pScene);
-
+    void parseProperties(const Properties& props);
 
     ref<Scene> mpScene;
     ref<SampleGenerator> mpSampleGenerator;
-    std::unique_ptr<AliasTable> mpAliasTable;
+    std::unique_ptr<EmissivePowerSampler> mpEmissivePowerSampler;
+
+    std::unique_ptr<LightReservoirMap> mpLRM;
 
     bool mEnableTemporalReuse = true;
     bool mEnableSpatialReuse = true;
+    uint mNumMaxBounces = 10;
 
     int mFrameCount = 0;
     uint2 mFrameDim;
 
-    int mNumLightSubpaths;
+    bool mOptionsChanged = false;
+
+    uint mNumLightSubpaths;
 
     ref<ComputePass> mpGenerateLightSubpathsPass;
     ref<ComputePass> mpCameraTraceAndConnectPass;
@@ -79,6 +85,9 @@ private:
     ref<ComputePass> mpSpatialReusePass;
     ref<ComputePass> mpFinalResolvePass;
 
+    ref<Buffer> mpLVC;
     ref<Buffer> mpReservoir;
     ref<Buffer> mpCausticReservoir;
+
+    ref<Buffer> mpDebugCounter;
 };

@@ -5,6 +5,10 @@ target_sources(ReSTIRBDPTPass PRIVATE
     ReSTIRBDPTPass.h
     GenerateLightSubpaths.cs.slang
     PathReservoir.slang
+    LightReservoirMap.cpp
+    LightReservoirMap.h
+    LRM.slang
+    LRM_Scatter.cs.slang
 )
 
 target_copy_shaders(ReSTIRBDPTPass RenderPasses/ReSTIRBDPTPass)

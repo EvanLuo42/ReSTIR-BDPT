@@ -3,7 +3,8 @@ import Utils.Sampling.SampleGenerator;
 import Scene.Raytracing;
 import Scene.RaytracingInline;
 
-struct PathVertex {
+struct PathVertex
+{
     GeometryInstanceID instanceID;
     uint primitiveID;
     float2 barycentrics;
@@ -42,13 +43,32 @@ struct LightSubpathVertex
 
 struct MisEvalData
 {
-    float dVC;
-    float dP;
+    float d_p_cam;         // $$d_{t-1}^p$$
+    float d_vc_cam;        // $$d_{t-1}^{VC}$$
+    float p_fwd_cam;       // $$\vec{p}_{t-1}$$
+    float p_rev_sigma_cam; // $$\vec{p}_{t-2} ^\sigma$$
 
-    float gammaBar;
-    float lambdaVCBar;
-    float lambdaPBar;
-    float sigmaBar;
+    float d_p_light;   // $$d_{s-1}^p$$
+    float d_vc_light;  // $$d_{s-1}^{VC}$$
+    float p_rev_light; // $$\overleftarrow{p}_{s-1}$$
+    float p_rev_sigma_light; // $$\overleftarrow{p}_{s-2}^\sigma$$
+
+    float d_p_r;         // $$d_r^p$$
+    float d_vc_r;        // $$d_r^{VC}$$
+    float p_rev_sigma_r; // $$\overleftarrow{p}_{r-1}^\sigma$$
+    float gamma;         // $$\vec{\gamma} = (g_{t-2} / p_{t-1})^\beta$$
+
+    float lambda_vc; // $$\overleftarrow{\lambda}^{VC}$$
+
+    float lambda_p; // $$\overleftarrow{\lambda}^p$$
+    float sigma;    // $$\overleftarrow{\sigma}$$
+    float g_ratio; // $$\overleftarrow{\sigma}$$
+
+    float p0_trace_light;   // $$p_0^{trace}(\bar{y})$$
+    float p0_connect_light; // $$p_0^{connect}(\bar{y})$$
+    float p0_trace_cam;     // $$p_0^{trace}(\bar{z})$$
+    float p0_connect_cam;   // $$p_0^{connect}(\bar{z})$$
+    float p_rev_cam;        // $$\overleftarrow{p}_{t-1}$$
 };
 
 struct CameraSubpathVertex
