@@ -26,13 +26,16 @@
  # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  **************************************************************************/
 #pragma once
+
+#include <cstddef>
+#include <memory>
 #include "Core/API/Buffer.h"
 #include "Core/Object.h"
 #include "Core/Pass/ComputePass.h"
-#include "Falcor.h"
 #include "RenderGraph/RenderPass.h"
 #include "Scene/Scene.h"
-#include "Utils/Algorithm/PrefixSum.h"
+#include "Utils/Math/VectorTypes.h"
+#include "Utils/Sampling/AliasTable.h"
 
 using namespace Falcor;
 
@@ -45,65 +48,36 @@ public:
 
     ReSTIRBDPTPass(ref<Device> pDevice, const Properties& props);
 
-    virtual Properties getProperties() const override;
-    virtual RenderPassReflection reflect(const CompileData& compileData) override;
-    virtual void compile(RenderContext* pRenderContext, const CompileData& compileData) override {}
-    virtual void execute(RenderContext* pRenderContext, const RenderData& renderData) override;
-    virtual void renderUI(Gui::Widgets& widget) override;
-    virtual void setScene(RenderContext* pRenderContext, const ref<Scene>& pScene) override {}
-    virtual bool onMouseEvent(const MouseEvent& mouseEvent) override { return false; }
-    virtual bool onKeyEvent(const KeyboardEvent& keyEvent) override { return false; }
+    Properties getProperties() const override;
+    RenderPassReflection reflect(const CompileData& compileData) override;
+    void compile(RenderContext* pRenderContext, const CompileData& compileData) override;
+    void execute(RenderContext* pRenderContext, const RenderData& renderData) override;
+    void renderUI(Gui::Widgets& widget) override;
+    void setScene(RenderContext* pRenderContext, const ref<Scene>& pScene) override;
+    bool onMouseEvent(const MouseEvent& mouseEvent) override { return false; }
+    bool onKeyEvent(const KeyboardEvent& keyEvent) override { return false; }
 
 private:
-    struct StaticParams
-    {};
+    void GenerateAliasTable(const ref<Scene>& pScene);
 
-    StaticParams mStaticParams;
 
     ref<Scene> mpScene;
     ref<SampleGenerator> mpSampleGenerator;
+    std::unique_ptr<AliasTable> mpAliasTable;
 
     bool mEnableTemporalReuse = true;
     bool mEnableSpatialReuse = true;
 
     int mFrameCount = 0;
+    uint2 mFrameDim;
 
-    int mNumLightSubpaths = 5;
+    int mNumLightSubpaths;
 
-    ref<ComputePass> mpLRMClearPass;
     ref<ComputePass> mpGenerateLightSubpathsPass;
-    ref<ComputePass> mpLRMScatterPass;
     ref<ComputePass> mpCameraTraceAndConnectPass;
-    ref<ComputePass> mpSpatialReusePass;
     ref<ComputePass> mpTemporalReusePass;
+    ref<ComputePass> mpSpatialReusePass;
     ref<ComputePass> mpFinalResolvePass;
-
-    static constexpr uint32_t kLRMNumBuckets = 100000;
-    static constexpr uint32_t kLRMBucketEntries = 32;
-    static constexpr uint32_t kLRMCellEntryCount = kLRMNumBuckets * kLRMBucketEntries;
-
-    static constexpr uint32_t kLRMMaxRecords = 4'000'000;
-    static constexpr uint32_t kLRMMaxTriplets = 4'000'000;
-    static constexpr uint32_t kLRMMaxCellStorage = 4'000'000;
-    static constexpr uint32_t kLRMMaxPerCell = 64;
-
-    // LRM
-    ref<Buffer> mpLRMRecords;
-    ref<Buffer> mpLRMTriplets;
-
-    ref<Buffer> mpLRMRecordCount;
-    ref<Buffer> mpLRMTripletCount;
-
-    ref<Buffer> mpLRMCellChecksum;
-    ref<Buffer> mpLRMCellCount;
-    ref<Buffer> mpLRMCellOffset;
-
-    ref<Buffer> mpLRMCellStorage;
-
-    // LVC
-    ref<Buffer> mpLightVertexCache;
-
-    ref<PrefixSum> mpPrefixSum;
 
     ref<Buffer> mpReservoir;
     ref<Buffer> mpCausticReservoir;

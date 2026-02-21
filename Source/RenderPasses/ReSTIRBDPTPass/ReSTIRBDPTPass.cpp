@@ -27,16 +27,39 @@
  **************************************************************************/
 #include "ReSTIRBDPTPass.h"
 
-extern "C" FALCOR_API_EXPORT void registerPlugin(Falcor::PluginRegistry& registry)
+#include <cstdint>
+#include <memory>
+#include <utility>
+#include <vector>
+#include "Utils/Sampling/AliasTable.h"
+
+extern "C" FALCOR_API_EXPORT void registerPlugin(PluginRegistry& registry)
 {
     registry.registerClass<RenderPass, ReSTIRBDPTPass>();
 }
 
-ReSTIRBDPTPass::ReSTIRBDPTPass(ref<Device> pDevice, const Properties& props) : RenderPass(pDevice) {}
+ReSTIRBDPTPass::ReSTIRBDPTPass(ref<Device> pDevice, const Properties& props) : RenderPass(std::move(pDevice)) {}
 
 Properties ReSTIRBDPTPass::getProperties() const
 {
     return {};
+}
+
+void ReSTIRBDPTPass::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene) {}
+
+void ReSTIRBDPTPass::GenerateAliasTable(const ref<Scene>& pScene)
+{
+    std::vector<float> weights;
+
+    for (uint32_t i = 0; i < pScene->getLightCount(); ++i)
+    {
+        auto light = pScene->getLight(i);
+        weights.push_back(light->getPower());
+    }
+
+    std::random_device rd;
+    std::mt19937 rng(rd());
+    mpAliasTable = std::make_unique<AliasTable>(mpDevice, weights, rng);
 }
 
 RenderPassReflection ReSTIRBDPTPass::reflect(const CompileData& compileData)
@@ -48,47 +71,12 @@ RenderPassReflection ReSTIRBDPTPass::reflect(const CompileData& compileData)
     return r;
 }
 
-void ReSTIRBDPTPass::execute(RenderContext* pRenderContext, const RenderData& renderData)
+void ReSTIRBDPTPass::compile(RenderContext* pRenderContext, const CompileData& compileData)
 {
-    auto var = mpLRMClearPass->getRootVar();
-    var["gLRMRecordCount"] = mpLRMRecordCount;
-    var["gLRMTripletCount"] = mpLRMTripletCount;
-    var["gLRMCellChecksum"] = mpLRMCellChecksum;
-    var["gLRMCellCount"] = mpLRMCellCount;
-    var["gLRMCellOffset"] = mpLRMCellOffset;
-
-    mpLRMClearPass->execute(pRenderContext, uint3((kLRMCellEntryCount + 255) / 256, 1, 1));
-
-    mpLRMClearPass->execute(pRenderContext, uint3((kLRMCellEntryCount + 255) / 256, 1, 1));
-
-    var = mpGenerateLightSubpathsPass->getRootVar();
-    var["gLRMRecords"] = mpLRMRecords;
-    var["gLRMTriplets"] = mpLRMTriplets;
-    var["gLRMRecordCount"] = mpLRMRecordCount;
-    var["gLRMTripletCount"] = mpLRMTripletCount;
-    var["gLRMCellChecksum"] = mpLRMCellChecksum;
-    var["gLRMCellCount"] = mpLRMCellCount;
-
-    mpGenerateLightSubpathsPass->execute(pRenderContext, uint3(( + 63) / 64, 1, 1));
-
-    pRenderContext->copyBufferRegion(
-        mpLRMCellOffset.get(), 0,
-        mpLRMCellCount.get(), 0,
-        sizeof(uint32_t) * kLRMCellEntryCount);
-
-    mpPrefixSum->execute(
-        pRenderContext,
-        mpLRMCellOffset,
-        kLRMCellEntryCount,
-        nullptr);
-
-    var = mpLRMScatterPass->getRootVar();
-    var["gLRMTriplets"] = mpLRMTriplets;
-    var["gLRMTripletCount"] = mpLRMTripletCount;
-    var["gLRMCellOffset"] = mpLRMCellOffset;
-    var["gLRMCellStorage"] = mpLRMCellStorage;
-
-    mpLRMScatterPass->execute(pRenderContext, uint3((kLRMMaxTriplets + 255) / 256, 1, 1));
+    mFrameDim = compileData.defaultTexDims;
+    mNumLightSubpaths = mFrameDim.x * mFrameDim.y;
 }
+
+void ReSTIRBDPTPass::execute(RenderContext* pRenderContext, const RenderData& renderData) {}
 
 void ReSTIRBDPTPass::renderUI(Gui::Widgets& widget) {}

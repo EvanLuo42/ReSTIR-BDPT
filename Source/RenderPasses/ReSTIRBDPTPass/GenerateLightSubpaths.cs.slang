@@ -1,218 +1,244 @@
 import PathReservoir;
 import Scene.Scene;
-import Scene.RaytracingInline;
-import Scene.Shading;
-import Scene.HitInfo;
-import Utils.Geometry.GeometryHelpers;
 import Utils.Sampling.SampleGenerator;
-import Scene.Raytracing;
-import Rendering.Lights.EmissiveLightSamplerHelpers;
+import Rendering.Lights.EmissivePowerSampler;
 import Utils.Math.MathHelpers;
-import LightUtils;
+import Utils.Math.HashUtils;
+import Scene.RaytracingInline;
 
-#include "LRM.slangh"
+#include "Utils/Math/MathConstants.slangh"
 
-cbuffer LightSubpathCB
+cbuffer CB
 {
-    uint gNumLightSubpaths;
-    uint gMaxBounces;
-    uint gFrameCount;
-    uint2 gRenderTargetDim;
+    int gNumLightSubpaths;
+    int gNumBounces;
+    int gMISPower;
+    int gFrameCount;
+    float gRoughnessThreshold;
 }
 
-RWStructuredBuffer<LightSubpathVertex> gLightVertexCache;
+AppendStructuredBuffer<LightSubpathVertex> gLVC;
 
-RWStructuredBuffer<uint> gLightVertexCounter;
-
-bool TraceNewLightVertex(inout SampleGenerator sg, inout float3 rayOrigin, inout float3 rayDir, inout LightSubpathVertex v, out bool isRough)
-{
-    SceneRayQuery<0> rq;
-    Ray ray = Ray(rayOrigin, rayDir, 1e-4f, 1e38f);
-
-    float hitT;
-    HitInfo hit = rq.traceRay(ray, hitT);
-
-    if (!hit.isValid())
-        return false;
-
-    TriangleHit triHit = hit.getTriangleHit();
-    VertexData vd = gScene.getVertexData(triHit);
-
-    PathVertex pv = PathVertex::create(vd.posW, vd.normalW, vd.faceNormalW);
-    v.y_s1 = pv;
-
-    uint matID = gScene.getMaterialID(triHit.instanceID);
-    ShadingData sd = gScene.materials.prepareShadingData(vd, matID, -rayDir);
-
-    let lod = ExplicitLodTextureSampler(0.f);
-    let mi = gScene.materials.getMaterialInstance(sd, lod);
-
-    BSDFSample bs;
-    if (!mi.sample(sd, sg, bs, true))
-        return false;
-
-    if (bs.pdf <= 0.f)
-        return false;
-
-    isRough = bs.isLobe(LobeType::NonDelta);
-
-    v.throughput *= bs.weight;
-    v.subpathPdf *= bs.pdf;
-    rayDir = bs.wo;
-
-    v.numVertices++;
-    v.numBounces++;
-
-    return true;
-}
-
-void InitializeLightPath(
-    inout SampleGenerator sg,
-    out SceneVertex y0,
-    out float3 y0PosW,
-    out float3 y0NgW,
-    out float3 y0NsW,
-    out float3 Le,
-    out float pA_y0
-)
-{
-    float selectionPdf;
-    uint triIdx = SampleEmissiveTriangle(sg, selectionPdf);
-
-    EmissiveTriangle tri = gScene.lightCollection.getTriangle(triIdx);
-    MeshLightData meshData = gScene.lightCollection.meshData[tri.lightIdx];
-
-    float3 bary = sample_triangle(sampleNext2D(sg));
-
-    y0.instanceID = meshData.instanceID;
-    y0.primitiveID = triIdx - meshData.triangleOffset;
-    y0.bary = bary.yz;
-
-    y0PosW = tri.getPosition(bary);
-    y0NgW = tri.normal;
-
-    y0NsW = tri.normal;
-
-    float2 uv = tri.getTexCoord(bary);
-    Le = gScene.materials.evalEmissive(tri.materialID, uv);
-
-    pA_y0 = selectionPdf / tri.area;
-}
-
-bool ConnectToCamera(LightSubpathVertex v, out PathReservoir r, out uint pixelIndex)
-{
-    float3 x = v.y_s1.pos;
-
-    float4 clip = mul(gScene.camera.getViewProj(), float4(x, 1));
-    if (clip.w <= 0)
-        return false;
-
-    float2 ndc = clip.xy / clip.w;
-    if (abs(ndc.x) > 1 || abs(ndc.y) > 1)
-        return false;
-
-    float2 screen = float2(ndc.x * 0.5f + 0.5f, -ndc.y * 0.5f + 0.5f);
-    uint2 pixel = uint2(screen * gRenderTargetDim);
-    pixelIndex = pixel.y * gRenderTargetDim.x + pixel.x;
-
-    float3 camPos = gScene.camera.getPosition();
-    float3 dir = normalize(camPos - x);
-    float dist = length(camPos - x);
-
-    SceneRayQuery<0> rq;
-    Ray ray = Ray(computeRayOrigin(x, v.y_s1.faceNormal), dir, 1e-4, dist - 1e-4);
-
-    if (!rq.traceVisibilityRay(ray))
-        return false;
-
-    float cosTheta = max(0, dot(v.y_s1.normal, dir));
-    float G = cosTheta / (dist * dist);
-
-    float3 contrib = v.throughput * G;
-
-    r = {};
-    r.pathF = contrib;
-    r.prefixPdf = v.subpathPdf;
-
-    r.xr = v.y_s1;
-    r.y0 = v.y0;
-
-    r.lightPathSeed = v.subpathSeed;
-    r.lightPathId = v.subpathId;
-
-    r.lightPathPdf = v.subpathPdf;
-    r.lightPathVertices = v.numVertices;
-
-    r.reconnectionCos = cosTheta;
-    r.reconnectionDist = dist;
-
-    r.UCW = length(contrib);
-
-    return true;
-}
+EmissivePowerSampler gEmissivePowerSampler;
 
 [numthreads(64, 1, 1)]
 void main(uint3 tid: SV_DispatchThreadID)
 {
     uint i = tid.x;
-    if (i >= gNumLightSubpaths)
+    if (i > gNumLightSubpaths)
         return;
 
     SampleGenerator sg = SampleGenerator(uint2(i, 0), gFrameCount);
+    LightSubpathVertex yj;
+    if (!InitializeLightPath(sg, i, yj))
+        return;
 
-    SceneVertex y0 = {};
-    float3 y0PosW, y0NgW, y0NsW, Le;
-    float pA_y0;
-    InitializeLightPath(sg, y0, y0PosW, y0NgW, y0NsW, Le, pA_y0);
-
-    LightSubpathVertex yj = {};
-    yj.y0 = y0;
-
-    yj.y_s1 = PathVertex::create(y0PosW, y0NsW, y0NgW);
-    yj.numVertices = 1;
-    yj.numBounces = 0;
-
-    float pdfW0;
-    float3 localDir = sample_cosine_hemisphere_concentric(sampleNext2D(sg), pdfW0);
-
-    float3 T, B;
-    branchlessONB(y0NsW, T, B);
-
-    float3 dir0 = normalize(localDir.x * T + localDir.y * B + localDir.z * y0NsW);
-
-    float cos0 = max(0.f, dot(y0NsW, dir0));
-
-    yj.throughput = (Le * cos0) / (pA_y0 * pdfW0);
-    yj.subpathPdf = pA_y0 * pdfW0;
-
-    yj.subpathSeed = i;
-    yj.subpathId = i;
-
-    float3 rayDir = dir0;
-    float3 rayOrigin = yj.y_s1.getRayOrigin(rayDir);
-
-    for (uint j = 1; j < gMaxBounces; ++j)
+    for (int j = 1; j < gNumBounces; ++j)
     {
-        bool isRough = false;
-        bool alive = TraceNewLightVertex(sg, rayOrigin, rayDir, yj, isRough);
-        if (!alive)
-            break;
+        bool rough = false;
+        if (!TraceNewVertex(sg, yj, rough))
+            return;
 
-        if (isRough)
+        if (rough)
         {
-            uint idx;
-            InterlockedAdd(gLightVertexCounter[0], 1, idx);
-
-            gLightVertexCache[idx] = yj;
-            yj.subpathId = idx;
-
-            PathReservoir r;
-            uint k;
-
-            if (ConnectToCamera(yj, r, k))
-            {
-                LRM_InsertReservoir(k, r);
-            }
+            gLVC.Append(yj);
+            PathReservoir k;
+            uint r = ConnectToCamera(yj, k);
         }
     }
+}
+
+bool InitializeLightPath(inout SampleGenerator sg, uint subpathId, out LightSubpathVertex y)
+{
+    if (gScene.lightCollection.isEmpty())
+        return false;
+
+    EmissivePower emissivePower = gEmissivePowerSampler._emissivePower;
+
+    float uLight = sampleNext1D(sg);
+    uint triangleCount = gScene.lightCollection.triangleCount;
+    uint triangleIndex = min((uint)(uLight * triangleCount), triangleCount - 1);
+
+    uint2 packed = emissivePower.triangleAliasTable[triangleIndex];
+    float threshold = f16tof32(packed.x >> 16u);
+    uint selectAbove = ((packed.x & 0xFFFFu) << 8u) | ((packed.y >> 24u) & 0xFFu);
+    uint selectBelow = packed.y & 0xFFFFFFu;
+
+    triangleIndex = (sampleNext1D(sg) >= threshold) ? selectAbove : selectBelow;
+
+    float triangleSelectionPdf = gScene.lightCollection.fluxData[triangleIndex].flux * emissivePower.invWeightsSum;
+
+    EmissiveTriangle tri = gScene.lightCollection.getTriangle(triangleIndex);
+
+    float2 uPos = sampleNext2D(sg);
+    float3 barycentrics = sample_triangle(uPos);
+
+    SceneVertex y0 = {};
+    y0.bary = barycentrics;
+    y0.triangleIndex = triangleIndex;
+    y.y0 = y0;
+
+    float3 posW = tri.getPosition(barycentrics);
+    float3 normal = tri.normal;
+    float3 faceNormal = tri.normal;
+
+    y.subpathPdf = triangleSelectionPdf * (1.0f / tri.area);
+    y.subpathSeed = jenkinsHash(subpathId ^ jenkinsHash(gFrameCount));
+    y.subpathId = subpathId;
+
+    y.diffuseBounces = 0;
+
+    y.numVertices = 1;
+    y.numBounces = 0;
+
+    y.dVC = 1;
+    y.dp = 0;
+
+    return true;
+}
+
+bool TraceNewVertex(inout SampleGenerator sg, inout LightSubpathVertex yj, out bool rough)
+{
+    LightSubpathVertex y_j1 = yj;
+
+    if (yj.numBounces == 0)
+    {
+        EmissiveTriangle tri = gScene.lightCollection.getTriangle(yj.y0.triangleIndex);
+        float3 lightPos = tri.getPosition(yj.y0.bary);
+        float3 lightNormal = tri.normal;
+
+        float2 uDir = sampleNext2D(sg);
+        float pdfSA;
+        float3 localDir = sample_cosine_hemisphere_concentric(uDir, pdfSA);
+
+        ShadingFrame sf;
+        sf.N = normalize(lightNormal);
+        sf.T = perp_stark(sf.N);
+        sf.B = cross(sf.N, sf.T);
+        float3 worldDir = sf.fromLocal(localDir);
+
+        SceneRayQuery<0> rq;
+        Ray ray = Ray(lightPos, worldDir, 1e-4f, 10000.0f);
+
+        float hitT;
+        HitInfo hit = rq.traceRay(ray, hitT);
+
+        if (!hit.isValid())
+            return false;
+
+        TriangleHit triHit = hit.getTriangleHit();
+        VertexData vd = gScene.getVertexData(triHit);
+        uint hitMaterialID = gScene.getMaterialID(triHit.instanceID);
+        ShadingData sdHit = gScene.materials.prepareShadingData(vd, hitMaterialID, -worldDir);
+
+        let miHit = gScene.materials.getMaterialInstance(sdHit, ExplicitLodTextureSampler(0.f));
+        BSDFProperties hitProps = miHit.getProperties(sdHit);
+        float rgh = hitProps.roughness;
+
+        rough = (rgh > 0.08f);
+
+        PathVertex y_s1;
+        y_s1.instanceID = triHit.instanceID;
+        y_s1.materialID = gScene.getMaterialID(triHit.instanceID);
+        y_s1.posW = vd.posW;
+        y_s1.primitiveID = triHit.primitiveIndex;
+        y_s1.dirIn = -ray.dir;
+        y_s1.barycentrics = triHit.barycentrics;
+
+        yj.y_s1 = y_s1;
+
+        float2 uv = tri.getTexCoord(yj.y0.bary);
+        float3 Le = gScene.materials.evalEmissive(tri.materialID, uv);
+
+        yj.throughput = Le * (M_PI / yj.subpathPdf);
+
+        float cosThetaIn = abs(dot(vd.normalW, -worldDir));
+        float distSq = max(hitT * hitT, 1e-7f);
+        float pdfFwdArea = pdfSA * (cosThetaIn / distSq);
+
+        float p0_trace = yj.subpathPdf * pdfSA;
+        float p0_connect = 1.0f;
+
+        yj.dp = p0_connect / max(p0_trace * pdfFwdArea, 1e-10f);
+        yj.dVC = (cosThetaIn / distSq) / max(p0_trace * pdfFwdArea, 1e-10f);
+
+        yj.subpathPdf *= pdfFwdArea;
+    }
+    else
+    {
+        TriangleHit currentHit;
+        currentHit.instanceID = yj.y_s1.instanceID;
+        currentHit.primitiveIndex = yj.y_s1.primitiveID;
+        currentHit.barycentrics = yj.y_s1.barycentrics;
+
+        VertexData vCurrent = gScene.getVertexData(currentHit);
+        ShadingData sdCurrent = gScene.materials.prepareShadingData(vCurrent, yj.y_s1.materialID, yj.y_s1.dirIn);
+        let mi = gScene.materials.getMaterialInstance(sdCurrent, ExplicitLodTextureSampler(0.f));
+
+        BSDFSample bsdfSample;
+        if (!mi.sample(sdCurrent, sg, bsdfSample) || bsdfSample.pdf == 0.0f)
+            return false;
+
+        SceneRayQuery<0> rq;
+        Ray ray = Ray(sdCurrent.posW, bsdfSample.wo, 1e-4f, 10000.0f);
+        float hitT;
+        HitInfo hit = rq.traceRay(ray, hitT);
+
+        if (!hit.isValid())
+            return false;
+
+        TriangleHit triHitNext = hit.getTriangleHit();
+        VertexData vNext = gScene.getVertexData(triHitNext);
+        uint nextMaterialID = gScene.getMaterialID(triHitNext.instanceID);
+        ShadingData sdNext = gScene.materials.prepareShadingData(vNext, nextMaterialID, -bsdfSample.wo);
+
+        float cosThetaOut = abs(dot(sdCurrent.frame.N, bsdfSample.wo));
+        float cosThetaIn = abs(dot(sdNext.frame.N, -bsdfSample.wo));
+        float distSq = max(hitT * hitT, 1e-7f);
+
+        float G = (cosThetaOut * cosThetaIn) / distSq;
+        float pdfFwdArea = bsdfSample.pdf * (cosThetaIn / distSq);
+
+        let miNext = gScene.materials.getMaterialInstance(sdNext, ExplicitLodTextureSampler(0.f));
+        float pdfRevSA = miNext.evalPdf(sdNext, -bsdfSample.wo);
+
+        bool isNonDelta = !bsdfSample.isLobe(LobeType::Delta);
+        float nonDelta = isNonDelta ? 1.0f : 0.0f;
+        float invPdfFwdArea = 1.0f / max(pdfFwdArea, 1e-10f);
+
+        float ratio = cosThetaOut / max(bsdfSample.pdf, 1e-10f);
+        float dVC_new = ratio * (nonDelta * yj.dp + pdfRevSA * yj.dVC);
+        float dp_new = nonDelta * invPdfFwdArea;
+
+        yj.dVC = dVC_new;
+        yj.dp = dp_new;
+
+        BSDFProperties nextProps = miNext.getProperties(sdNext);
+        float rgh = nextProps.roughness;
+        float p_terminate = clamp(0.2f * rgh, 0.0f, 0.95f);
+        float p_survive = 1.0f - p_terminate;
+
+        if (sampleNext1D(sg) < p_terminate)
+            return false;
+
+        rough = (rgh > 0.08f);
+
+        yj.throughput = (yj.throughput * bsdfSample.weight) / p_survive;
+        yj.subpathPdf *= (pdfFwdArea * p_survive);
+
+        yj.y_s1.instanceID = triHitNext.instanceID;
+        yj.y_s1.materialID = nextMaterialID;
+        yj.y_s1.posW = sdNext.posW;
+        yj.y_s1.primitiveID = triHitNext.primitiveIndex;
+        yj.y_s1.dirIn = -ray.dir;
+        yj.y_s1.barycentrics = triHitNext.barycentrics;
+    }
+
+    yj.numBounces++;
+    yj.numVertices++;
+    return true;
+}
+
+uint ConnectToCamera(LightSubpathVertex yj, out PathReservoir k)
+{
 }
