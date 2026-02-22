@@ -245,8 +245,11 @@ bool TraceNewVertex(inout SampleGenerator sg, inout LightSubpathVertex yj, out b
         if (rough)
             yj.diffuseBounces |= (1u << (yj.numBounces + 1));
 
-        float pdfRevSA_prev = mi.evalPdf(sdCurrent, yj.y_s1.dirIn);
-        if (isDelta) pdfRevSA_prev = 1.0f;
+        ShadingData sdCurrentRev = gScene.materials.prepareShadingData(vCurrent, yj.y_s1.materialID, bsdfSample.wo);
+        let miRev = gScene.materials.getMaterialInstance(sdCurrentRev, ExplicitLodTextureSampler(0.f));
+        float pdfRevSA_prev = miRev.evalPdf(sdCurrentRev, yj.y_s1.dirIn);
+        if (isDelta)
+            pdfRevSA_prev = 1.0f;
 
         bool isNonDelta = !bsdfSample.isLobe(LobeType::Delta);
         float nonDelta = isNonDelta ? 1.0f : 0.0f;
@@ -344,7 +347,7 @@ bool ConnectToCamera(in LightSubpathVertex yj, inout SampleGenerator sg, out Pat
 
     float p_revArea = pdfRevSA * (cosThetaCam / distSq);
     float prefixFraction = pow(p_revArea / gNumLightSubpaths, gMISPower);
-    float w_light = prefixFraction * (yj.dp + pow(pdfRevSA, gMISPower) * yj.dVC);
+    float w_light = prefixFraction * (yj.dp + pow(p_revArea, gMISPower) * yj.dVC);
     float misWeight = 1.0f / (w_light + 1.0f);
 
     bool isCaustic = false;

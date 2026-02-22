@@ -230,8 +230,8 @@ bool TraceNewVertex(inout SampleGenerator sg, inout CameraSubpathVertex xj, uint
         float p0_trace = 1.0f;
         float p0_connect = 1.0f;
 
-        xj.dp = pow(float(gNumLightSubpaths) * invPdfFwdArea, beta);
-        xj.dVC = pow(float(gNumLightSubpaths) * (cosThetaIn / distSq) * invPdfFwdArea, beta);
+        xj.dp = pow(invPdfFwdArea, beta);
+        xj.dVC = pow((cosThetaIn / distSq) * invPdfFwdArea, beta);
 
         xj.pdfFwd = pdfFwdArea;
 
@@ -387,9 +387,13 @@ bool ConnectToRandomLight(in CameraSubpathVertex xj, inout SampleGenerator sg, o
     float beta = float(gMISPower);
 
     float ratio = pdfFwdArea / max(pdfLightArea, 1e-15f);
-    float w_cam = pow(ratio, beta) * (xj.dp + pow(pdfRevSA, beta) * xj.dVC);
+    float w_bar_0 = pow(pdfFwdArea / max(pdfLightArea, 1e-15f), gMISPower);
 
-    float misWeight = 1.0f / (w_cam + 1.0f);
+    float pdfRevFromLight_SA = cosThetaIn * M_1_PI;
+    float pdfRevFromLight_Area = pdfRevFromLight_SA * cosThetaOut / distSq;
+    float w_bar_t = pow(pdfRevFromLight_Area, gMISPower) * (xj.dp + pow(pdfRevSA, gMISPower) * xj.dVC);
+
+    float misWeight = 1.0f / (w_bar_0 + 1.0f + w_bar_t);
 
     bool isCaustic = false;
     if (xj.bounces > 0)
@@ -527,7 +531,7 @@ bool ConnectToRandomLVC(in CameraSubpathVertex xj, inout SampleGenerator sg, out
 
     float beta = float(gMISPower);
 
-    float w_cam = pow(pdfFwdArea_cam, beta) * (xj.dp + pow(pdfRevSA_cam, beta) * xj.dVC);
+    float w_cam = pow(pdfFwdArea_cam * float(lvcSize), beta) * (xj.dp + pow(pdfRevSA_cam, beta) * xj.dVC);
     float w_light = pow(pdfFwdArea_light, beta) * (yk.dp + pow(pdfRevSA_light, beta) * yk.dVC);
 
     float misWeight = 1.0f / (w_cam + 1.0f + w_light);
@@ -538,7 +542,7 @@ bool ConnectToRandomLVC(in CameraSubpathVertex xj, inout SampleGenerator sg, out
         bool isPrevRough = (xj.diffuseBounces & (1u << (xj.bounces - 1))) != 0;
         isCaustic = !isPrevRough;
     }
-
+    
     InitializeReservoir(isCaustic, r);
 
     r.confidenceWeight = 1.0f;
