@@ -73,11 +73,11 @@ private:
     uint mNumMaxBounces = 10;
 
     int mFrameCount = 0;
-    uint2 mFrameDim;
+    uint2 mFrameDim = {0, 0};
 
     bool mOptionsChanged = false;
 
-    uint mNumLightSubpaths;
+    uint mNumLightSubpaths = 0;
 
     ref<ComputePass> mpGenerateLightSubpathsPass;
     ref<ComputePass> mpCameraTraceAndConnectPass;

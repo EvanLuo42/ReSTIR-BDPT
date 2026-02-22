@@ -10,6 +10,7 @@ target_sources(ReSTIRBDPTPass PRIVATE
     LRM.slang
     LRM_Scatter.cs.slang
     CameraTraceAndConnect.cs.slang
+    FinalResolve.cs.slang
 )
 
 target_copy_shaders(ReSTIRBDPTPass RenderPasses/ReSTIRBDPTPass)

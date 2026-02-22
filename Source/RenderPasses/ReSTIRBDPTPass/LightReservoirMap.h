@@ -11,9 +11,9 @@ using namespace Falcor;
 class LightReservoirMap
 {
 public:
-    LightReservoirMap(ref<Device> pDevice, ref<Scene> pScene, uint2 resolution, uint maxLightPaths);
+    LightReservoirMap(ref<Device> pDevice, ref<Scene> pScene, const ShaderVar& var, uint2 resolution, uint maxLightPaths);
 
-    static std::unique_ptr<LightReservoirMap> create(ref<Device> pDevice, ref<Scene> pScene, uint2 resolution, uint maxLightPaths);
+    static std::unique_ptr<LightReservoirMap> create(ref<Device> pDevice, ref<Scene> pScene, const ShaderVar& var, uint2 resolution, uint maxLightPaths);
 
     void beginFrame(RenderContext* pRenderContext);
 

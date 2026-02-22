@@ -2,22 +2,22 @@
 #include <memory>
 #include "Core/API/Buffer.h"
 #include "Core/API/Device.h"
+#include "Core/Program/ShaderVar.h"
 #include "Scene/Scene.h"
 #include "Utils/Algorithm/PrefixSum.h"
 
-std::unique_ptr<LightReservoirMap> LightReservoirMap::create(ref<Device> pDevice, ref<Scene> pScene, uint2 resolution, uint maxLightPaths)
+std::unique_ptr<LightReservoirMap> LightReservoirMap::create(ref<Device> pDevice, ref<Scene> pScene, const ShaderVar& var, uint2 resolution, uint maxLightPaths)
 {
-    return std::make_unique<LightReservoirMap>(pDevice, pScene, resolution, maxLightPaths);
+    return std::make_unique<LightReservoirMap>(pDevice, pScene, var, resolution, maxLightPaths);
 }
 
-LightReservoirMap::LightReservoirMap(ref<Device> pDevice, ref<Scene> pScene, uint2 resolution, uint maxLightPaths)
+LightReservoirMap::LightReservoirMap(ref<Device> pDevice, ref<Scene> pScene, const ShaderVar& var, uint2 resolution, uint maxLightPaths)
     : mpDevice(pDevice), mpScene(pScene), mResolution(resolution), mMaxLightPaths(maxLightPaths)
 {
     mNumPixels = resolution.x * resolution.y;
 
-    uint32_t reservoirSize = 256;
     mpGlobalReservoirs = pDevice->createStructuredBuffer(
-        reservoirSize,
+        var["globalReservoirs"],
         mMaxLightPaths,
         ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess,
         MemoryType::DeviceLocal,
@@ -44,11 +44,7 @@ LightReservoirMap::LightReservoirMap(ref<Device> pDevice, ref<Scene> pScene, uin
     );
 
     mpAppendCounter = pDevice->createStructuredBuffer(
-        sizeof(uint32_t),
-        1,
-        ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess, MemoryType::DeviceLocal,
-        nullptr,
-        false
+        sizeof(uint32_t), 1, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess, MemoryType::DeviceLocal, nullptr, false
     );
 
     mpIndexBuffer = pDevice->createStructuredBuffer(

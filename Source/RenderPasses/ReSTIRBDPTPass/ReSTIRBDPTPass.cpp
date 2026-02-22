@@ -32,6 +32,7 @@
 #include "Core/API/Buffer.h"
 #include "RenderGraph/RenderPassHelpers.h"
 #include "Rendering/Lights/EmissivePowerSampler.h"
+#include "Utils/Logger.h"
 #include "Utils/Properties.h"
 #include "RenderGraph/RenderPassStandardFlags.h"
 
@@ -44,10 +45,7 @@ namespace
 {
 const char kGenerateLightSubpathsShader[] = "RenderPasses/ReSTIRBDPTPass/GenerateLightSubpaths.cs.slang";
 const char kCameraTraceAndConnectShader[] = "RenderPasses/ReSTIRBDPTPass/CameraTraceAndConnect.cs.slang";
-
-const ChannelList kOutputChannels = {
-    {"color", "gOutputColor", "Output color (sum of direct and indirect)", false, ResourceFormat::RGBA32Float},
-};
+const char kFinalResolveShader[] = "RenderPasses/ReSTIRBDPTPass/FinalResolve.cs.slang";
 
 const float kRoughnessThreshold = 0.08f;
 
@@ -117,7 +115,52 @@ void ReSTIRBDPTPass::setScene(RenderContext* pRenderContext, const ref<Scene>& p
         mpCameraTraceAndConnectPass = ComputePass::create(mpDevice, desc, defines, true);
     }
 
-    mpLRM = LightReservoirMap::create(mpDevice, mpScene, mFrameDim, mNumLightSubpaths);
+    {
+        ProgramDesc desc;
+        desc.addShaderModules(mpScene->getShaderModules());
+        desc.addTypeConformances(mpScene->getTypeConformances());
+        desc.addShaderLibrary(kFinalResolveShader).csEntry("main");
+        mpFinalResolvePass = ComputePass::create(mpDevice, desc, defines, true);
+    }
+
+    uint32_t maxLVCSize = mNumLightSubpaths * mNumMaxBounces;
+
+    auto lightVar = mpGenerateLightSubpathsPass->getRootVar();
+
+    mpLVC = mpDevice->createStructuredBuffer(
+        lightVar["gLVC"],
+        maxLVCSize,
+        ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess,
+        MemoryType::DeviceLocal,
+        nullptr,
+        true
+    );
+
+    uint32_t numPixels = mNumLightSubpaths;
+
+    auto cameraVar = mpCameraTraceAndConnectPass->getRootVar();
+    mpOutputReservoirs = mpDevice->createStructuredBuffer(
+        cameraVar["gOutputReservoirs"],
+        numPixels,
+        ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess,
+        MemoryType::DeviceLocal,
+        nullptr,
+        false
+    );
+    mpOutputCausticReservoirs = mpDevice->createStructuredBuffer(
+        cameraVar["gOutputCausticReservoirs"],
+        numPixels,
+        ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess,
+        MemoryType::DeviceLocal,
+        nullptr,
+        false
+    );
+
+    if (mFrameDim.x > 0 && mFrameDim.y > 0)
+    {
+        auto var = mpCameraTraceAndConnectPass->getRootVar();
+        mpLRM = LightReservoirMap::create(mpDevice, mpScene, var["gLRM"], mFrameDim, mNumLightSubpaths);
+    }
 
     mpDebugCounter = mpDevice->createStructuredBuffer(
         sizeof(uint32_t), 1, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess, MemoryType::DeviceLocal, nullptr, false
@@ -128,7 +171,9 @@ RenderPassReflection ReSTIRBDPTPass::reflect(const CompileData& compileData)
 {
     RenderPassReflection r;
 
-    r.addOutput("color", "Final output");
+    r.addOutput("color", "Final output")
+        .bindFlags(ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource)
+        .format(ResourceFormat::RGBA32Float);
 
     return r;
 }
@@ -137,35 +182,6 @@ void ReSTIRBDPTPass::compile(RenderContext* pRenderContext, const CompileData& c
 {
     mFrameDim = compileData.defaultTexDims;
     mNumLightSubpaths = mFrameDim.x * mFrameDim.y;
-
-    uint32_t maxLVCSize = mNumLightSubpaths * mNumMaxBounces;
-
-    mpLVC = mpDevice->createStructuredBuffer(
-        100, maxLVCSize, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess, MemoryType::DeviceLocal, nullptr, true
-    );
-
-    uint32_t numPixels = mNumLightSubpaths;
-
-    size_t reservoirSize = 256;
-    mpOutputReservoirs = mpDevice->createStructuredBuffer(
-        reservoirSize,
-        numPixels,
-        ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess,
-        MemoryType::DeviceLocal,
-        nullptr,
-        false
-    );
-    mpOutputCausticReservoirs = mpDevice->createStructuredBuffer(
-        reservoirSize,
-        numPixels,
-        ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess,
-        MemoryType::DeviceLocal,
-        nullptr,
-        false
-    );
-
-    if (mpScene)
-        mpLRM = LightReservoirMap::create(mpDevice, mpScene, mFrameDim, mNumLightSubpaths);
 }
 
 void ReSTIRBDPTPass::execute(RenderContext* pRenderContext, const RenderData& renderData)
@@ -180,12 +196,6 @@ void ReSTIRBDPTPass::execute(RenderContext* pRenderContext, const RenderData& re
 
     if (!mpScene)
     {
-        for (auto it : kOutputChannels)
-        {
-            Texture* pDst = renderData.getTexture(it.name).get();
-            if (pDst)
-                pRenderContext->clearTexture(pDst);
-        }
         return;
     }
 
@@ -214,8 +224,7 @@ void ReSTIRBDPTPass::execute(RenderContext* pRenderContext, const RenderData& re
 
     varLight["gDebugCounter"] = mpDebugCounter;
 
-    uint32_t threadGroups = div_round_up(mNumLightSubpaths, 64u);
-    mpGenerateLightSubpathsPass->execute(pRenderContext, threadGroups, 1, 1);
+    mpGenerateLightSubpathsPass->execute(pRenderContext, mFrameDim.x * mFrameDim.y, 1, 1);
 
     mpLRM->executeSort(pRenderContext);
 
@@ -224,7 +233,7 @@ void ReSTIRBDPTPass::execute(RenderContext* pRenderContext, const RenderData& re
     mpSampleGenerator->bindShaderData(varCamera);
     mpEmissivePowerSampler->bindShaderData(varCamera["gEmissivePowerSampler"]);
     mpScene->bindShaderDataForRaytracing(pRenderContext, varCamera["gScene"]);
-    
+
     varCamera["CB"]["gNumLightSubpaths"] = mNumLightSubpaths;
     varCamera["CB"]["gNumBounces"] = mNumMaxBounces;
     varCamera["CB"]["gMISPower"] = 1.0f;
@@ -237,9 +246,23 @@ void ReSTIRBDPTPass::execute(RenderContext* pRenderContext, const RenderData& re
     varCamera["gOutputReservoirs"] = mpOutputReservoirs;
     varCamera["gOutputCausticReservoirs"] = mpOutputCausticReservoirs;
 
-    uint32_t threadGroupsX = div_round_up(mFrameDim.x, 16u);
-    uint32_t threadGroupsY = div_round_up(mFrameDim.y, 16u);
-    mpCameraTraceAndConnectPass->execute(pRenderContext, threadGroupsX, threadGroupsY, 1);
+    mpCameraTraceAndConnectPass->execute(pRenderContext, uint3(mFrameDim, 1));
+
+    auto varResolve = mpFinalResolvePass->getRootVar();
+
+    auto pDstColor = renderData.getTexture("color");
+    if (pDstColor)
+    {
+        varResolve["gOutputReservoirs"] = mpOutputReservoirs;
+        varResolve["gOutputCausticReservoirs"] = mpOutputCausticReservoirs;
+
+        varResolve["gOutputColor"] = pDstColor;
+
+        varResolve["CB"]["gTargetDim"] = mFrameDim;
+
+        pRenderContext->clearUAV(pDstColor->getUAV().get(), uint4(0x3f800000, 0, 0, 0x3f800000));
+        mpFinalResolvePass->execute(pRenderContext, uint3(mFrameDim, 1));
+    }
 
     mFrameCount++;
 }
