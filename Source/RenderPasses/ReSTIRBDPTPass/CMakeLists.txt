@@ -9,6 +9,7 @@ target_sources(ReSTIRBDPTPass PRIVATE
     LightReservoirMap.h
     LRM.slang
     LRM_Scatter.cs.slang
+    CameraTraceAndConnect.cs.slang
 )
 
 target_copy_shaders(ReSTIRBDPTPass RenderPasses/ReSTIRBDPTPass)

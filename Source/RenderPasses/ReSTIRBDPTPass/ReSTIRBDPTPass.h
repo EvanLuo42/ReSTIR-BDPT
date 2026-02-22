@@ -86,8 +86,8 @@ private:
     ref<ComputePass> mpFinalResolvePass;
 
     ref<Buffer> mpLVC;
-    ref<Buffer> mpReservoir;
-    ref<Buffer> mpCausticReservoir;
+    ref<Buffer> mpOutputReservoirs;
+    ref<Buffer> mpOutputCausticReservoirs;
 
     ref<Buffer> mpDebugCounter;
 };

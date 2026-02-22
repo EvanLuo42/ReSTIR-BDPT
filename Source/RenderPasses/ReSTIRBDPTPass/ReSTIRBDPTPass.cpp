@@ -43,6 +43,7 @@ extern "C" FALCOR_API_EXPORT void registerPlugin(PluginRegistry& registry)
 namespace
 {
 const char kGenerateLightSubpathsShader[] = "RenderPasses/ReSTIRBDPTPass/GenerateLightSubpaths.cs.slang";
+const char kCameraTraceAndConnectShader[] = "RenderPasses/ReSTIRBDPTPass/CameraTraceAndConnect.cs.slang";
 
 const ChannelList kOutputChannels = {
     {"color", "gOutputColor", "Output color (sum of direct and indirect)", false, ResourceFormat::RGBA32Float},
@@ -108,6 +109,14 @@ void ReSTIRBDPTPass::setScene(RenderContext* pRenderContext, const ref<Scene>& p
         mpGenerateLightSubpathsPass = ComputePass::create(mpDevice, desc, defines, true);
     }
 
+    {
+        ProgramDesc desc;
+        desc.addShaderModules(mpScene->getShaderModules());
+        desc.addTypeConformances(mpScene->getTypeConformances());
+        desc.addShaderLibrary(kCameraTraceAndConnectShader).csEntry("main");
+        mpCameraTraceAndConnectPass = ComputePass::create(mpDevice, desc, defines, true);
+    }
+
     mpLRM = LightReservoirMap::create(mpDevice, mpScene, mFrameDim, mNumLightSubpaths);
 
     mpDebugCounter = mpDevice->createStructuredBuffer(
@@ -133,6 +142,26 @@ void ReSTIRBDPTPass::compile(RenderContext* pRenderContext, const CompileData& c
 
     mpLVC = mpDevice->createStructuredBuffer(
         100, maxLVCSize, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess, MemoryType::DeviceLocal, nullptr, true
+    );
+
+    uint32_t numPixels = mNumLightSubpaths;
+
+    size_t reservoirSize = 256;
+    mpOutputReservoirs = mpDevice->createStructuredBuffer(
+        reservoirSize,
+        numPixels,
+        ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess,
+        MemoryType::DeviceLocal,
+        nullptr,
+        false
+    );
+    mpOutputCausticReservoirs = mpDevice->createStructuredBuffer(
+        reservoirSize,
+        numPixels,
+        ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess,
+        MemoryType::DeviceLocal,
+        nullptr,
+        false
     );
 
     if (mpScene)
@@ -167,28 +196,50 @@ void ReSTIRBDPTPass::execute(RenderContext* pRenderContext, const RenderData& re
 
     pRenderContext->clearUAV(mpDebugCounter->getUAV().get(), uint4(0));
 
-    auto var = mpGenerateLightSubpathsPass->getRootVar();
+    auto varLight = mpGenerateLightSubpathsPass->getRootVar();
 
-    mpSampleGenerator->bindShaderData(var);
-    mpEmissivePowerSampler->bindShaderData(var["gEmissivePowerSampler"]);
-    mpScene->bindShaderDataForRaytracing(pRenderContext, var["gScene"]);
+    mpSampleGenerator->bindShaderData(varLight);
+    mpEmissivePowerSampler->bindShaderData(varLight["gEmissivePowerSampler"]);
+    mpScene->bindShaderDataForRaytracing(pRenderContext, varLight["gScene"]);
 
-    var["CB"]["gNumLightSubpaths"] = mNumLightSubpaths;
-    var["CB"]["gNumBounces"] = mNumMaxBounces;
-    var["CB"]["gMISPower"] = 1;
-    var["CB"]["gFrameCount"] = mFrameCount;
-    var["CB"]["gTargetDim"] = mFrameDim;
-    var["CB"]["gRoughnessThreshold"] = kRoughnessThreshold;
+    varLight["CB"]["gNumLightSubpaths"] = mNumLightSubpaths;
+    varLight["CB"]["gNumBounces"] = mNumMaxBounces;
+    varLight["CB"]["gMISPower"] = 1.0f;
+    varLight["CB"]["gFrameCount"] = mFrameCount;
+    varLight["CB"]["gTargetDim"] = mFrameDim;
+    varLight["CB"]["gRoughnessThreshold"] = kRoughnessThreshold;
 
-    var["gLVC"] = mpLVC;
-    mpLRM->bindShaderData(var["gLRM"]);
+    varLight["gLVC"] = mpLVC;
+    mpLRM->bindShaderData(varLight["gLRM"]);
 
-    var["gDebugCounter"] = mpDebugCounter;
+    varLight["gDebugCounter"] = mpDebugCounter;
 
     uint32_t threadGroups = div_round_up(mNumLightSubpaths, 64u);
     mpGenerateLightSubpathsPass->execute(pRenderContext, threadGroups, 1, 1);
 
     mpLRM->executeSort(pRenderContext);
+
+    auto varCamera = mpCameraTraceAndConnectPass->getRootVar();
+
+    mpSampleGenerator->bindShaderData(varCamera);
+    mpEmissivePowerSampler->bindShaderData(varCamera["gEmissivePowerSampler"]);
+    mpScene->bindShaderDataForRaytracing(pRenderContext, varCamera["gScene"]);
+    
+    varCamera["CB"]["gNumLightSubpaths"] = mNumLightSubpaths;
+    varCamera["CB"]["gNumBounces"] = mNumMaxBounces;
+    varCamera["CB"]["gMISPower"] = 1.0f;
+    varCamera["CB"]["gFrameCount"] = mFrameCount;
+    varCamera["CB"]["gTargetDim"] = mFrameDim;
+    varCamera["CB"]["gRoughnessThreshold"] = kRoughnessThreshold;
+
+    varCamera["gLVC"] = mpLVC;
+    mpLRM->bindShaderData(varCamera["gLRM"]);
+    varCamera["gOutputReservoirs"] = mpOutputReservoirs;
+    varCamera["gOutputCausticReservoirs"] = mpOutputCausticReservoirs;
+
+    uint32_t threadGroupsX = div_round_up(mFrameDim.x, 16u);
+    uint32_t threadGroupsY = div_round_up(mFrameDim.y, 16u);
+    mpCameraTraceAndConnectPass->execute(pRenderContext, threadGroupsX, threadGroupsY, 1);
 
     mFrameCount++;
 }

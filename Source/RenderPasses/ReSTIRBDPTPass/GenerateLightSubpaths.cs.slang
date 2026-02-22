@@ -13,7 +13,7 @@ cbuffer CB
 {
     int gNumLightSubpaths;
     int gNumBounces;
-    int gMISPower;
+    float gMISPower;
     int gFrameCount;
     uint2 gTargetDim;
     float gRoughnessThreshold;
@@ -43,7 +43,7 @@ void main(uint3 tid: SV_DispatchThreadID)
     for (int j = 1; j < gNumBounces; ++j)
     {
         bool rough = false;
-        
+
         if (!TraceNewVertex(sg, yj, rough))
             break;
 
@@ -98,7 +98,7 @@ bool InitializeLightPath(inout SampleGenerator sg, uint subpathId, out LightSubp
     y.subpathSeed = jenkinsHash(subpathId ^ jenkinsHash(gFrameCount));
     y.subpathId = subpathId;
 
-    y.diffuseBounces = 0;
+    y.diffuseBounces = 1;
 
     y.numVertices = 1;
     y.numBounces = 0;
@@ -137,7 +137,7 @@ bool TraceNewVertex(inout SampleGenerator sg, inout LightSubpathVertex yj, out b
 
         if (!hit.isValid())
             return false;
-        
+
         TriangleHit triHit = hit.getTriangleHit();
         VertexData vd = gScene.getVertexData(triHit);
         uint hitMaterialID = gScene.getMaterialID(triHit.instanceID);
@@ -147,7 +147,12 @@ bool TraceNewVertex(inout SampleGenerator sg, inout LightSubpathVertex yj, out b
         BSDFProperties hitProps = miHit.getProperties(sdHit);
         float rgh = hitProps.roughness;
 
-        rough = (rgh > 0.08f);
+        rough = (rgh > gRoughnessThreshold);
+
+        if (rough)
+        { 
+            yj.diffuseBounces |= (1u << (yj.numBounces + 1));
+        }
 
         PathVertex y_s1;
         y_s1.instanceID = triHit.instanceID;
@@ -219,8 +224,11 @@ bool TraceNewVertex(inout SampleGenerator sg, inout LightSubpathVertex yj, out b
         float invPdfFwdArea = 1.0f / max(pdfFwdArea, 1e-10f);
 
         float ratio = cosThetaOut / max(bsdfSample.pdf, 1e-10f);
-        float dVC_new = ratio * (nonDelta * yj.dp + pdfRevSA * yj.dVC);
-        float dp_new = nonDelta * invPdfFwdArea;
+
+        float beta = float(gMISPower);
+        float dVC_new = pow(ratio, beta) * (nonDelta * yj.dp + pow(pdfRevSA, beta) * yj.dVC);
+
+        float dp_new = nonDelta * pow(invPdfFwdArea, beta);
 
         yj.dVC = dVC_new;
         yj.dp = dp_new;
@@ -251,7 +259,7 @@ bool TraceNewVertex(inout SampleGenerator sg, inout LightSubpathVertex yj, out b
     return true;
 }
 
-bool ConnectToCamera(LightSubpathVertex yj, inout SampleGenerator sg, out PathReservoir r, out uint k)
+bool ConnectToCamera(in LightSubpathVertex yj, inout SampleGenerator sg, out PathReservoir r, out uint k)
 {
     float3 cameraPos = gScene.camera.data.posW;
     float3 dirToCamera = cameraPos - yj.y_s1.posW;
@@ -316,10 +324,18 @@ bool ConnectToCamera(LightSubpathVertex yj, inout SampleGenerator sg, out PathRe
 
     float p_revArea = pdfRevSA * (cosThetaCam / distSq);
     float w_light = (p_revArea / max(float(gNumLightSubpaths), 1.0f)) * (yj.dp + pdfRevSA * yj.dVC);
-    //
     float misWeight = 1.0f / (w_light + 1.0f);
 
     float invPdf = 1.0f / max(float(gNumLightSubpaths) * yj.subpathPdf, 1e-15f);
+
+    bool isCaustic = false;
+    if (yj.numBounces > 0)
+    { 
+        bool isPrevRough = (yj.diffuseBounces & (1u << (yj.numBounces - 1))) != 0;
+        isCaustic = !isPrevRough;
+    }
+
+    InitializeReservoir(isCaustic, r);
 
     r.UCW = invPdf;
 
@@ -344,7 +360,8 @@ bool ConnectToCamera(LightSubpathVertex yj, inout SampleGenerator sg, out PathRe
     r.lightPathId = yj.subpathId;
     r.lightPathPdf = yj.subpathPdf;
     r.lightPathVertices = yj.numVertices;
-    r.lightPathDiffuseBounces = yj.diffuseBounces;
+    r.lightPathDiffuseBounces = r.lightPathDiffuseBounces = countbits(yj.diffuseBounces);
+    ;
 
     r.cameraSubpathSeed = 0;
     r.cameraSubpathId = 0;
