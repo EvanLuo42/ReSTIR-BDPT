@@ -199,17 +199,6 @@ bool TraceNewVertex(inout SampleGenerator sg, inout LightSubpathVertex yj, out b
         if (!mi.sample(sdCurrent, sg, bsdfSample))
             return false;
 
-        bool isDelta = bsdfSample.isLobe(LobeType::Delta);
-
-        if (isDelta)
-            bsdfSample.pdf = 1.0f;
-
-        if (bsdfSample.pdf == 0.0f && !isDelta)
-            return false;
-
-        if (all(bsdfSample.weight == 0.0f))
-            return false;
-
         SceneRayQuery<0> rq;
         Ray ray = Ray(sdCurrent.posW, bsdfSample.wo, 1e-4f, 10000.0f);
         float hitT;
@@ -223,13 +212,6 @@ bool TraceNewVertex(inout SampleGenerator sg, inout LightSubpathVertex yj, out b
         uint nextMaterialID = gScene.getMaterialID(triHitNext.instanceID);
         ShadingData sdNext = gScene.materials.prepareShadingData(vNext, nextMaterialID, -bsdfSample.wo);
 
-        float cosThetaOut = abs(dot(sdCurrent.frame.N, bsdfSample.wo));
-        float cosThetaIn = abs(dot(sdNext.frame.N, -bsdfSample.wo));
-        float distSq = max(hitT * hitT, 1e-7f);
-
-        float G = (cosThetaOut * cosThetaIn) / distSq;
-        float pdfFwdArea = bsdfSample.pdf * (cosThetaIn / distSq);
-
         let miNext = gScene.materials.getMaterialInstance(sdNext, ExplicitLodTextureSampler(0.f));
 
         BSDFProperties nextProps = miNext.getProperties(sdNext);
@@ -240,25 +222,28 @@ bool TraceNewVertex(inout SampleGenerator sg, inout LightSubpathVertex yj, out b
         if (sampleNext1D(sg) < p_terminate)
             terminate = true;
 
-        rough = (rgh > gRoughnessThreshold);
+        float alpha = max(rgh * rgh, 1e-4f);
+        bool deltaLike = (alpha < gRoughnessThreshold);
+        rough = bsdfSample.isLobe(LobeType::NonDelta) && !deltaLike;
 
         if (rough)
             yj.diffuseBounces |= (1u << (yj.numBounces + 1));
 
-        ShadingData sdCurrentRev = gScene.materials.prepareShadingData(vCurrent, yj.y_s1.materialID, bsdfSample.wo);
-        let miRev = gScene.materials.getMaterialInstance(sdCurrentRev, ExplicitLodTextureSampler(0.f));
-        float pdfRevSA_prev = miRev.evalPdf(sdCurrentRev, yj.y_s1.dirIn);
-        if (isDelta)
-            pdfRevSA_prev = 1.0f;
+        uint nonDelta = bsdfSample.isLobe(LobeType::NonDelta) ? 1 : 0;
 
-        bool isNonDelta = !bsdfSample.isLobe(LobeType::Delta);
-        float nonDelta = isNonDelta ? 1.0f : 0.0f;
-        float invPdfFwdArea = 1.0f / (pdfFwdArea * p_survive);
+        float cosThetaIn = abs(dot(vNext.normalW, -bsdfSample.wo));
+        float distSq = max(hitT * hitT, 1e-7f);
+        float pdfFwdArea = bsdfSample.pdf * (cosThetaIn / distSq);
 
-        float ratio = (cosThetaOut / distSq) / (pdfFwdArea * p_survive);
+        float cosThetaPrev = abs(dot(sdCurrent.faceN, bsdfSample.wo));
+        float geomRev = cosThetaPrev / distSq;
 
-        float dp_new = nonDelta * pow(invPdfFwdArea, gMISPower);
-        float dVC_new = pow(ratio, gMISPower) * (nonDelta * yj.dp + pow(pdfRevSA_prev, gMISPower) * yj.dVC);
+        ShadingData sdRev = gScene.materials.prepareShadingData(vCurrent, yj.y_s1.materialID, -bsdfSample.wo);
+        let miRev = gScene.materials.getMaterialInstance(sdRev, ExplicitLodTextureSampler(0.f));
+        float p_rev_sigma = miRev.evalPdf(sdRev, yj.y_s1.dirIn);
+
+        float dp_new = nonDelta * pow(1.0f / pdfFwdArea, gMISPower);
+        float dVC_new = pow(geomRev / pdfFwdArea, gMISPower) * (nonDelta * yj.dp + pow(p_rev_sigma, gMISPower) * yj.dVC);
 
         yj.dVC = dVC_new;
         yj.dp = dp_new;
@@ -336,7 +321,7 @@ bool ConnectToCamera(in LightSubpathVertex yj, inout SampleGenerator sg, out Pat
         return false;
 
     float cosThetaCam4 = cosThetaCam * cosThetaCam * cosThetaCam * cosThetaCam;
-    float cameraImportance = 1.0f / cosThetaCam4;
+    float cameraImportance = 1.0f;
 
     float geometryFactor = cosThetaCam / distSq;
     float3 unweightedContribution = yj.throughput * bsdfWeight * geometryFactor * cameraImportance;
@@ -346,12 +331,25 @@ bool ConnectToCamera(in LightSubpathVertex yj, inout SampleGenerator sg, out Pat
     float cosThetaOut = abs(dot(sdCurrent.frame.N, dirToCamera));
 
     float p_revArea = pdfRevSA * (cosThetaCam / distSq);
-    float prefixFraction = pow(p_revArea / gNumLightSubpaths, gMISPower);
-    float w_light = prefixFraction * (yj.dp + pow(p_revArea, gMISPower) * yj.dVC);
+
+    float halfWidth = length(gScene.camera.data.cameraU);
+    float halfHeight = length(gScene.camera.data.cameraV);
+    float imagePlaneArea = 4.0f * halfWidth * halfHeight;
+
+    float cosThetaCam3 = cosThetaCam * cosThetaCam * cosThetaCam;
+    float p_camSA = 1.0f / (imagePlaneArea * cosThetaCam3);
+
+    float p_camArea = p_camSA * (cosThetaOut / distSq);
+
+    float numCameraSubpaths = gTargetDim.x * gTargetDim.y;
+    float pathRatio = numCameraSubpaths / (float)gNumLightSubpaths;
+
+    float prefixFraction = pow(p_camArea * pathRatio, gMISPower);
+    float w_light = prefixFraction * (yj.dp + pow(pdfRevSA, gMISPower) * yj.dVC);
     float misWeight = 1.0f / (w_light + 1.0f);
 
     bool isCaustic = false;
-    if (yj.numBounces > 0)
+    if (yj.numBounces >= 2)
     {
         bool isPrevRough = (yj.diffuseBounces & (1u << (yj.numBounces - 1))) != 0;
         isCaustic = !isPrevRough;
