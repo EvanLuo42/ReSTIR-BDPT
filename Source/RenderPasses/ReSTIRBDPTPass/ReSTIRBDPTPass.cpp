@@ -30,11 +30,11 @@
 #include <memory>
 #include <utility>
 #include "Core/API/Buffer.h"
-#include "RenderGraph/RenderPassHelpers.h"
 #include "Rendering/Lights/EmissivePowerSampler.h"
 #include "Utils/Logger.h"
 #include "Utils/Properties.h"
 #include "RenderGraph/RenderPassStandardFlags.h"
+#include "Utils/Timing/Profiler.h"
 
 extern "C" FALCOR_API_EXPORT void registerPlugin(PluginRegistry& registry)
 {
@@ -85,15 +85,32 @@ Properties ReSTIRBDPTPass::getProperties() const
 
 void ReSTIRBDPTPass::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
 {
-    mFrameCount = 0;
-
     mpScene = pScene;
+
+    mpGenerateLightSubpathsPass = nullptr;
+    mpCameraTraceAndConnectPass = nullptr;
+    mpFinalResolvePass = nullptr;
+    mpLVC = nullptr;
+    mpOutputReservoirs = nullptr;
+    mpOutputCausticReservoirs = nullptr;
+    mpDebugCounter = nullptr;
+    mpLRM = nullptr;
+    mpSampleGenerator = nullptr;
+    mpEmissivePowerSampler = nullptr;
+
+    mFrameCount = 0;
+    mRecompile = true;
 
     if (!mpScene)
         return;
 
     mpSampleGenerator = SampleGenerator::create(mpDevice, SAMPLE_GENERATOR_TINY_UNIFORM);
     mpEmissivePowerSampler = std::make_unique<EmissivePowerSampler>(pRenderContext, mpScene->getILightCollection(pRenderContext));
+}
+
+void ReSTIRBDPTPass::preparePasses()
+{
+    FALCOR_ASSERT(mpScene);
 
     DefineList defines = mpScene->getSceneDefines();
     defines.add(mpSampleGenerator->getDefines());
@@ -123,10 +140,17 @@ void ReSTIRBDPTPass::setScene(RenderContext* pRenderContext, const ref<Scene>& p
         mpFinalResolvePass = ComputePass::create(mpDevice, desc, defines, true);
     }
 
+    mReallocate = true;
+}
+
+void ReSTIRBDPTPass::prepareResources()
+{
+    FALCOR_ASSERT(mpGenerateLightSubpathsPass && mpCameraTraceAndConnectPass);
+    FALCOR_ASSERT(mFrameDim.x > 0 && mFrameDim.y > 0);
+
     uint32_t maxLVCSize = mNumLightSubpaths * mNumMaxBounces;
 
     auto lightVar = mpGenerateLightSubpathsPass->getRootVar();
-
     mpLVC = mpDevice->createStructuredBuffer(
         lightVar["gLVC"],
         maxLVCSize,
@@ -136,12 +160,10 @@ void ReSTIRBDPTPass::setScene(RenderContext* pRenderContext, const ref<Scene>& p
         true
     );
 
-    uint32_t numPixels = mNumLightSubpaths;
-
     auto cameraVar = mpCameraTraceAndConnectPass->getRootVar();
     mpOutputReservoirs = mpDevice->createStructuredBuffer(
         cameraVar["gOutputReservoirs"],
-        numPixels,
+        mNumLightSubpaths,
         ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess,
         MemoryType::DeviceLocal,
         nullptr,
@@ -149,22 +171,87 @@ void ReSTIRBDPTPass::setScene(RenderContext* pRenderContext, const ref<Scene>& p
     );
     mpOutputCausticReservoirs = mpDevice->createStructuredBuffer(
         cameraVar["gOutputCausticReservoirs"],
-        numPixels,
+        mNumLightSubpaths,
         ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess,
         MemoryType::DeviceLocal,
         nullptr,
         false
     );
 
-    if (mFrameDim.x > 0 && mFrameDim.y > 0)
-    {
-        auto var = mpCameraTraceAndConnectPass->getRootVar();
-        mpLRM = LightReservoirMap::create(mpDevice, mpScene, var["gLRM"], mFrameDim, mNumLightSubpaths);
-    }
+    mpLRM = LightReservoirMap::create(mpDevice, mpScene, cameraVar["gLRM"], mFrameDim, mNumLightSubpaths);
 
     mpDebugCounter = mpDevice->createStructuredBuffer(
         sizeof(uint32_t), 1, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess, MemoryType::DeviceLocal, nullptr, false
     );
+
+    mFrameCount = 0;
+}
+
+void ReSTIRBDPTPass::executeGenerateLightSubpaths(RenderContext* pRenderContext)
+{
+    FALCOR_PROFILE(pRenderContext, "GenerateLightSubpaths");
+
+    pRenderContext->clearUAVCounter(mpLVC, 0);
+    pRenderContext->clearUAV(mpDebugCounter->getUAV().get(), uint4(0));
+
+    auto var = mpGenerateLightSubpathsPass->getRootVar();
+
+    mpSampleGenerator->bindShaderData(var);
+    mpEmissivePowerSampler->bindShaderData(var["gEmissivePowerSampler"]);
+    mpScene->bindShaderDataForRaytracing(pRenderContext, var["gScene"]);
+
+    var["CB"]["gNumLightSubpaths"] = mNumLightSubpaths;
+    var["CB"]["gNumBounces"] = mNumMaxBounces;
+    var["CB"]["gMISPower"] = 1.0f;
+    var["CB"]["gFrameCount"] = mFrameCount;
+    var["CB"]["gTargetDim"] = mFrameDim;
+    var["CB"]["gRoughnessThreshold"] = kRoughnessThreshold;
+
+    var["gLVC"] = mpLVC;
+    mpLRM->bindShaderData(var["gLRM"]);
+    var["gDebugCounter"] = mpDebugCounter;
+
+    mpGenerateLightSubpathsPass->execute(pRenderContext, mNumLightSubpaths, 1, 1);
+}
+
+void ReSTIRBDPTPass::executeCameraTraceAndConnect(RenderContext* pRenderContext)
+{
+    FALCOR_PROFILE(pRenderContext, "CameraTraceAndConnect");
+
+    auto var = mpCameraTraceAndConnectPass->getRootVar();
+
+    mpSampleGenerator->bindShaderData(var);
+    mpEmissivePowerSampler->bindShaderData(var["gEmissivePowerSampler"]);
+    mpScene->bindShaderDataForRaytracing(pRenderContext, var["gScene"]);
+
+    var["CB"]["gNumLightSubpaths"] = mNumLightSubpaths;
+    var["CB"]["gNumBounces"] = mNumMaxBounces;
+    var["CB"]["gMISPower"] = 1.0f;
+    var["CB"]["gFrameCount"] = mFrameCount;
+    var["CB"]["gTargetDim"] = mFrameDim;
+    var["CB"]["gRoughnessThreshold"] = kRoughnessThreshold;
+
+    var["gLVC"] = mpLVC;
+    mpLRM->bindShaderData(var["gLRM"]);
+    var["gOutputReservoirs"] = mpOutputReservoirs;
+    var["gOutputCausticReservoirs"] = mpOutputCausticReservoirs;
+
+    mpCameraTraceAndConnectPass->execute(pRenderContext, uint3(mFrameDim, 1));
+}
+
+void ReSTIRBDPTPass::executeFinalResolve(RenderContext* pRenderContext, const ref<Texture>& pDstColor)
+{
+    FALCOR_PROFILE(pRenderContext, "FinalResolve");
+
+    pRenderContext->clearUAV(pDstColor->getUAV().get(), uint4(0x3f800000, 0, 0, 0x3f800000));
+
+    auto var = mpFinalResolvePass->getRootVar();
+    var["gOutputReservoirs"] = mpOutputReservoirs;
+    var["gOutputCausticReservoirs"] = mpOutputCausticReservoirs;
+    var["gOutputColor"] = pDstColor;
+    var["CB"]["gTargetDim"] = mFrameDim;
+
+    mpFinalResolvePass->execute(pRenderContext, uint3(mFrameDim, 1));
 }
 
 RenderPassReflection ReSTIRBDPTPass::reflect(const CompileData& compileData)
@@ -180,8 +267,14 @@ RenderPassReflection ReSTIRBDPTPass::reflect(const CompileData& compileData)
 
 void ReSTIRBDPTPass::compile(RenderContext* pRenderContext, const CompileData& compileData)
 {
-    mFrameDim = compileData.defaultTexDims;
-    mNumLightSubpaths = mFrameDim.x * mFrameDim.y;
+    const uint2 newDim = compileData.defaultTexDims;
+    if (newDim.x != mFrameDim.x || newDim.y != mFrameDim.y)
+    {
+        mFrameDim.x = newDim.x;
+        mFrameDim.y = newDim.y;
+        mNumLightSubpaths = mFrameDim.x * mFrameDim.y;
+        mReallocate = true;
+    }
 }
 
 void ReSTIRBDPTPass::execute(RenderContext* pRenderContext, const RenderData& renderData)
@@ -195,74 +288,37 @@ void ReSTIRBDPTPass::execute(RenderContext* pRenderContext, const RenderData& re
     }
 
     if (!mpScene)
-    {
         return;
+
+    if (mRecompile)
+    {
+        preparePasses();
+        mRecompile = false;
+    }
+
+    if (mReallocate)
+    {
+        if (mFrameDim.x == 0 || mFrameDim.y == 0)
+            return;
+        prepareResources();
+        mReallocate = false;
     }
 
     mpEmissivePowerSampler->update(pRenderContext, mpScene->getILightCollection(pRenderContext));
     mpLRM->beginFrame(pRenderContext);
 
-    pRenderContext->clearUAVCounter(mpLVC, 0);
+    executeGenerateLightSubpaths(pRenderContext);
 
-    pRenderContext->clearUAV(mpDebugCounter->getUAV().get(), uint4(0));
+    {
+        FALCOR_PROFILE(pRenderContext, "LRM Sort");
+        mpLRM->executeSort(pRenderContext);
+    }
 
-    auto varLight = mpGenerateLightSubpathsPass->getRootVar();
-
-    mpSampleGenerator->bindShaderData(varLight);
-    mpEmissivePowerSampler->bindShaderData(varLight["gEmissivePowerSampler"]);
-    mpScene->bindShaderDataForRaytracing(pRenderContext, varLight["gScene"]);
-
-    varLight["CB"]["gNumLightSubpaths"] = mNumLightSubpaths;
-    varLight["CB"]["gNumBounces"] = mNumMaxBounces;
-    varLight["CB"]["gMISPower"] = 1.0f;
-    varLight["CB"]["gFrameCount"] = mFrameCount;
-    varLight["CB"]["gTargetDim"] = mFrameDim;
-    varLight["CB"]["gRoughnessThreshold"] = kRoughnessThreshold;
-
-    varLight["gLVC"] = mpLVC;
-    mpLRM->bindShaderData(varLight["gLRM"]);
-
-    varLight["gDebugCounter"] = mpDebugCounter;
-
-    mpGenerateLightSubpathsPass->execute(pRenderContext, mFrameDim.x * mFrameDim.y, 1, 1);
-
-    mpLRM->executeSort(pRenderContext);
-
-    auto varCamera = mpCameraTraceAndConnectPass->getRootVar();
-
-    mpSampleGenerator->bindShaderData(varCamera);
-    mpEmissivePowerSampler->bindShaderData(varCamera["gEmissivePowerSampler"]);
-    mpScene->bindShaderDataForRaytracing(pRenderContext, varCamera["gScene"]);
-
-    varCamera["CB"]["gNumLightSubpaths"] = mNumLightSubpaths;
-    varCamera["CB"]["gNumBounces"] = mNumMaxBounces;
-    varCamera["CB"]["gMISPower"] = 1.0f;
-    varCamera["CB"]["gFrameCount"] = mFrameCount;
-    varCamera["CB"]["gTargetDim"] = mFrameDim;
-    varCamera["CB"]["gRoughnessThreshold"] = kRoughnessThreshold;
-
-    varCamera["gLVC"] = mpLVC;
-    mpLRM->bindShaderData(varCamera["gLRM"]);
-    varCamera["gOutputReservoirs"] = mpOutputReservoirs;
-    varCamera["gOutputCausticReservoirs"] = mpOutputCausticReservoirs;
-
-    mpCameraTraceAndConnectPass->execute(pRenderContext, uint3(mFrameDim, 1));
-
-    auto varResolve = mpFinalResolvePass->getRootVar();
+    executeCameraTraceAndConnect(pRenderContext);
 
     auto pDstColor = renderData.getTexture("color");
     if (pDstColor)
-    {
-        varResolve["gOutputReservoirs"] = mpOutputReservoirs;
-        varResolve["gOutputCausticReservoirs"] = mpOutputCausticReservoirs;
-
-        varResolve["gOutputColor"] = pDstColor;
-
-        varResolve["CB"]["gTargetDim"] = mFrameDim;
-
-        pRenderContext->clearUAV(pDstColor->getUAV().get(), uint4(0x3f800000, 0, 0, 0x3f800000));
-        mpFinalResolvePass->execute(pRenderContext, uint3(mFrameDim, 1));
-    }
+        executeFinalResolve(pRenderContext, pDstColor);
 
     mFrameCount++;
 }

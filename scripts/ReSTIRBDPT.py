@@ -5,8 +5,12 @@ def render_graph_ReSTIRBDPT():
 
     ReSTIRBDPT = createPass("ReSTIRBDPTPass", {})
     g.addPass(ReSTIRBDPT, "ReSTIRBDPTPass")
+    ToneMapper = createPass("ToneMapper", {'autoExposure': False, 'exposureCompensation': 0.0})
+    g.addPass(ToneMapper, "ToneMapper")
 
-    g.markOutput("ReSTIRBDPTPass.color")
+    g.addEdge("ReSTIRBDPTPass.color", "ToneMapper.src")
+
+    g.markOutput("ToneMapper.dst")
 
     return g
 

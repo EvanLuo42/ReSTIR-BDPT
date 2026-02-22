@@ -62,32 +62,46 @@ public:
 private:
     void parseProperties(const Properties& props);
 
+    // Initialization stages
+    void preparePasses();
+    void prepareResources();
+
+    // Per-frame pass execution
+    void executeGenerateLightSubpaths(RenderContext* pRenderContext);
+    void executeCameraTraceAndConnect(RenderContext* pRenderContext);
+    void executeFinalResolve(RenderContext* pRenderContext, const ref<Texture>& pDstColor);
+
+    // Scene & samplers
     ref<Scene> mpScene;
     ref<SampleGenerator> mpSampleGenerator;
     std::unique_ptr<EmissivePowerSampler> mpEmissivePowerSampler;
-
     std::unique_ptr<LightReservoirMap> mpLRM;
 
+    // Options
     bool mEnableTemporalReuse = true;
     bool mEnableSpatialReuse = true;
-    uint mNumMaxBounces = 10;
+    uint mNumMaxBounces = 5;
 
+    // Frame state
     int mFrameCount = 0;
     uint2 mFrameDim = {0, 0};
-
-    bool mOptionsChanged = false;
-
     uint mNumLightSubpaths = 0;
 
+    // Dirty flags
+    bool mOptionsChanged = false;
+    bool mRecompile = false;
+    bool mReallocate = false;
+
+    // Compute passes
     ref<ComputePass> mpGenerateLightSubpathsPass;
     ref<ComputePass> mpCameraTraceAndConnectPass;
     ref<ComputePass> mpTemporalReusePass;
     ref<ComputePass> mpSpatialReusePass;
     ref<ComputePass> mpFinalResolvePass;
 
+    // GPU buffers
     ref<Buffer> mpLVC;
     ref<Buffer> mpOutputReservoirs;
     ref<Buffer> mpOutputCausticReservoirs;
-
     ref<Buffer> mpDebugCounter;
 };

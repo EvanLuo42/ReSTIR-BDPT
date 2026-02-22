@@ -43,8 +43,9 @@ void main(uint3 tid: SV_DispatchThreadID)
     for (int j = 1; j < gNumBounces; ++j)
     {
         bool rough = false;
+        bool terminate = false;
 
-        if (!TraceNewVertex(sg, yj, rough))
+        if (!TraceNewVertex(sg, yj, rough, terminate))
             break;
 
         if (rough)
@@ -57,6 +58,9 @@ void main(uint3 tid: SV_DispatchThreadID)
 
             gLRM.Insert(k, r);
         }
+
+        if (terminate)
+            break;
     }
 }
 
@@ -109,7 +113,7 @@ bool InitializeLightPath(inout SampleGenerator sg, uint subpathId, out LightSubp
     return true;
 }
 
-bool TraceNewVertex(inout SampleGenerator sg, inout LightSubpathVertex yj, out bool rough)
+bool TraceNewVertex(inout SampleGenerator sg, inout LightSubpathVertex yj, out bool rough, out bool terminate)
 {
     LightSubpathVertex y_j1 = yj;
 
@@ -150,9 +154,7 @@ bool TraceNewVertex(inout SampleGenerator sg, inout LightSubpathVertex yj, out b
         rough = (rgh > gRoughnessThreshold);
 
         if (rough)
-        { 
             yj.diffuseBounces |= (1u << (yj.numBounces + 1));
-        }
 
         PathVertex y_s1;
         y_s1.instanceID = triHit.instanceID;
@@ -170,14 +172,15 @@ bool TraceNewVertex(inout SampleGenerator sg, inout LightSubpathVertex yj, out b
         yj.throughput = Le * (M_PI / yj.subpathPdf);
 
         float cosThetaIn = abs(dot(vd.normalW, -worldDir));
+        float cosThetaOut = abs(dot(lightNormal, worldDir));
         float distSq = max(hitT * hitT, 1e-7f);
         float pdfFwdArea = pdfSA * (cosThetaIn / distSq);
 
-        float p0_trace = yj.subpathPdf * pdfSA;
-        float p0_connect = 1.0f;
+        float p0_trace = yj.subpathPdf;
+        float p0_connect = yj.subpathPdf;
 
-        yj.dp = p0_connect / max(p0_trace * pdfFwdArea, 1e-10f);
-        yj.dVC = (cosThetaIn / distSq) / max(p0_trace * pdfFwdArea, 1e-10f);
+        yj.dp = pow(p0_connect / (p0_trace * pdfFwdArea), gMISPower);
+        yj.dVC = pow((cosThetaOut / distSq) / (p0_trace * pdfFwdArea), gMISPower);
 
         yj.subpathPdf *= pdfFwdArea;
     }
@@ -193,7 +196,18 @@ bool TraceNewVertex(inout SampleGenerator sg, inout LightSubpathVertex yj, out b
         let mi = gScene.materials.getMaterialInstance(sdCurrent, ExplicitLodTextureSampler(0.f));
 
         BSDFSample bsdfSample;
-        if (!mi.sample(sdCurrent, sg, bsdfSample) || bsdfSample.pdf == 0.0f)
+        if (!mi.sample(sdCurrent, sg, bsdfSample))
+            return false;
+
+        bool isDelta = bsdfSample.isLobe(LobeType::Delta);
+
+        if (isDelta)
+            bsdfSample.pdf = 1.0f;
+
+        if (bsdfSample.pdf == 0.0f && !isDelta)
+            return false;
+
+        if (all(bsdfSample.weight == 0.0f))
             return false;
 
         SceneRayQuery<0> rq;
@@ -217,21 +231,6 @@ bool TraceNewVertex(inout SampleGenerator sg, inout LightSubpathVertex yj, out b
         float pdfFwdArea = bsdfSample.pdf * (cosThetaIn / distSq);
 
         let miNext = gScene.materials.getMaterialInstance(sdNext, ExplicitLodTextureSampler(0.f));
-        float pdfRevSA = miNext.evalPdf(sdNext, -bsdfSample.wo);
-
-        bool isNonDelta = !bsdfSample.isLobe(LobeType::Delta);
-        float nonDelta = isNonDelta ? 1.0f : 0.0f;
-        float invPdfFwdArea = 1.0f / max(pdfFwdArea, 1e-10f);
-
-        float ratio = cosThetaOut / max(bsdfSample.pdf, 1e-10f);
-
-        float beta = float(gMISPower);
-        float dVC_new = pow(ratio, beta) * (nonDelta * yj.dp + pow(pdfRevSA, beta) * yj.dVC);
-
-        float dp_new = nonDelta * pow(invPdfFwdArea, beta);
-
-        yj.dVC = dVC_new;
-        yj.dp = dp_new;
 
         BSDFProperties nextProps = miNext.getProperties(sdNext);
         float rgh = nextProps.roughness;
@@ -239,9 +238,27 @@ bool TraceNewVertex(inout SampleGenerator sg, inout LightSubpathVertex yj, out b
         float p_survive = 1.0f - p_terminate;
 
         if (sampleNext1D(sg) < p_terminate)
-            return false;
+            terminate = true;
 
-        rough = (rgh > 0.08f);
+        rough = (rgh > gRoughnessThreshold);
+
+        if (rough)
+            yj.diffuseBounces |= (1u << (yj.numBounces + 1));
+
+        float pdfRevSA_prev = mi.evalPdf(sdCurrent, yj.y_s1.dirIn);
+        if (isDelta) pdfRevSA_prev = 1.0f;
+
+        bool isNonDelta = !bsdfSample.isLobe(LobeType::Delta);
+        float nonDelta = isNonDelta ? 1.0f : 0.0f;
+        float invPdfFwdArea = 1.0f / (pdfFwdArea * p_survive);
+
+        float ratio = (cosThetaOut / distSq) / (pdfFwdArea * p_survive);
+
+        float dp_new = nonDelta * pow(invPdfFwdArea, gMISPower);
+        float dVC_new = pow(ratio, gMISPower) * (nonDelta * yj.dp + pow(pdfRevSA_prev, gMISPower) * yj.dVC);
+
+        yj.dVC = dVC_new;
+        yj.dp = dp_new;
 
         yj.throughput = (yj.throughput * bsdfSample.weight) / p_survive;
         yj.subpathPdf *= (pdfFwdArea * p_survive);
@@ -301,7 +318,9 @@ bool ConnectToCamera(in LightSubpathVertex yj, inout SampleGenerator sg, out Pat
     if (all(bsdfWeight == 0.0f))
         return false;
 
-    float pdfRevSA = mi.evalPdf(sdCurrent, dirToCamera);
+    ShadingData sdReverse = gScene.materials.prepareShadingData(vCurrent, yj.y_s1.materialID, dirToCamera);
+    let miReverse = gScene.materials.getMaterialInstance(sdReverse, ExplicitLodTextureSampler(0.f));
+    float pdfRevSA = miReverse.evalPdf(sdReverse, yj.y_s1.dirIn);
 
     SceneRayQuery<0> rq;
     Ray ray = Ray(yj.y_s1.posW, dirToCamera, 1e-4f, dist - 1e-4f);
@@ -309,35 +328,35 @@ bool ConnectToCamera(in LightSubpathVertex yj, inout SampleGenerator sg, out Pat
     if (!rq.traceVisibilityRay(ray))
         return false;
 
-    float cosThetaCam = dot(gScene.camera.data.cameraW, -dirToCamera);
+    float cosThetaCam = dot(normalize(gScene.camera.data.cameraW), -dirToCamera);
     if (cosThetaCam <= 0.0f)
         return false;
 
     float cosThetaCam4 = cosThetaCam * cosThetaCam * cosThetaCam * cosThetaCam;
-    float cameraImportance = 1.0f / max(cosThetaCam4, 1e-6f);
+    float cameraImportance = 1.0f / cosThetaCam4;
 
-    float3 unweightedContribution = yj.throughput * bsdfWeight * cameraImportance;
+    float geometryFactor = cosThetaCam / distSq;
+    float3 unweightedContribution = yj.throughput * bsdfWeight * geometryFactor * cameraImportance;
     if (all(unweightedContribution == 0.0f))
         return false;
 
     float cosThetaOut = abs(dot(sdCurrent.frame.N, dirToCamera));
 
     float p_revArea = pdfRevSA * (cosThetaCam / distSq);
-    float w_light = (p_revArea / max(float(gNumLightSubpaths), 1.0f)) * (yj.dp + pdfRevSA * yj.dVC);
+    float prefixFraction = pow(p_revArea / gNumLightSubpaths, gMISPower);
+    float w_light = prefixFraction * (yj.dp + pow(pdfRevSA, gMISPower) * yj.dVC);
     float misWeight = 1.0f / (w_light + 1.0f);
-
-    float invPdf = 1.0f / max(float(gNumLightSubpaths) * yj.subpathPdf, 1e-15f);
 
     bool isCaustic = false;
     if (yj.numBounces > 0)
-    { 
+    {
         bool isPrevRough = (yj.diffuseBounces & (1u << (yj.numBounces - 1))) != 0;
         isCaustic = !isPrevRough;
     }
 
     InitializeReservoir(isCaustic, r);
 
-    r.UCW = invPdf;
+    r.UCW = 1.0f;
 
     r.confidenceWeight = 1.0f;
 
@@ -356,12 +375,13 @@ bool ConnectToCamera(in LightSubpathVertex yj, inout SampleGenerator sg, out Pat
     r.reconnectionCos = cosThetaOut;
     r.reconnectionDist = dist;
 
+    r.flags.IsCaustic = isCaustic;
+
     r.lightPathSeed = yj.subpathSeed;
     r.lightPathId = yj.subpathId;
     r.lightPathPdf = yj.subpathPdf;
     r.lightPathVertices = yj.numVertices;
-    r.lightPathDiffuseBounces = r.lightPathDiffuseBounces = countbits(yj.diffuseBounces);
-    ;
+    r.lightPathDiffuseBounces = countbits(yj.diffuseBounces);
 
     r.cameraSubpathSeed = 0;
     r.cameraSubpathId = 0;

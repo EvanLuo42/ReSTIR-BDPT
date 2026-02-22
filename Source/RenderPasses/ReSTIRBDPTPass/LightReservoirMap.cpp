@@ -1,4 +1,5 @@
 #include "LightReservoirMap.h"
+#include <cstddef>
 #include <memory>
 #include "Core/API/Buffer.h"
 #include "Core/API/Device.h"
@@ -84,11 +85,7 @@ void LightReservoirMap::executeSort(RenderContext* pRenderContext)
 {
     pRenderContext->copyResource(mpIndexBuffer.get(), mpCellCounters.get());
 
-    uint32_t totalReservoirs = 0;
-    mpPrefixSum->execute(pRenderContext, mpIndexBuffer, mNumPixels, &totalReservoirs);
-
-    if (totalReservoirs == 0)
-        return;
+    mpPrefixSum->execute(pRenderContext, mpIndexBuffer, mNumPixels);
 
     auto var = mpScatterPass->getRootVar()["gLRM"];
     bindShaderData(var);

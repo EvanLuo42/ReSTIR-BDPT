@@ -79,6 +79,7 @@ struct CameraSubpathVertex
     float3 throughput;   // Accumulated path throughput
     uint bounces;        // Current depth/bounce count
     uint diffuseBounces; // Number of rough/diffuse bounces encountered
+    float pathPdf;
 
     float dVC; // $$d_i^{VC}$$
     float dp;  // $$d_i^p$$
@@ -140,7 +141,6 @@ struct PathReservoir
     float reconnectionDist;
 
     float3 dirOut;
-    float pad2;
 
     SceneVertex y0;
 
@@ -156,7 +156,7 @@ struct PathReservoir
 
     [mutating]
     void Merge(inout SampleGenerator sg, in PathReservoir r)
-    { 
+    {
         float q_hat = luminance(r.pathF);
         float p_hat = q_hat * r.misWeight;
 
@@ -173,7 +173,8 @@ struct PathReservoir
 
             this.bounces = r.bounces;
             this.prefixBounces = r.prefixBounces;
-            this.prefixDiffuseBounces = r.prefixDiffuseBounces; 
+            this.prefixDiffuseBounces = r.prefixDiffuseBounces;
+            this.flags = r.flags;
 
             this.pathF = r.pathF;
             this.misWeight = r.misWeight;
