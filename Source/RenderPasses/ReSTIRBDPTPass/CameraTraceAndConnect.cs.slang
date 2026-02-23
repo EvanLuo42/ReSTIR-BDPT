@@ -226,8 +226,7 @@ bool TraceNewVertex(
     {
         float invPdfFwdArea = 1.0f / max(pdfFwdArea, 1e-10f);
 
-        // xj.dp = pow(float(gNumLightSubpaths) / pdfFwdArea, gMISPower);
-        xj.dp = 0.0f;
+        xj.dp = pow(float(gNumLightSubpaths) / pdfFwdArea, gMISPower);
         xj.dVC = 0.0f;
 
         xj.gamma = 0.0f;
