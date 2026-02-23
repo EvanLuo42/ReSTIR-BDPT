@@ -50,6 +50,7 @@ protected:
     ref<Texture> pLeftSrcTex;
     ref<Texture> pRightSrcTex;
     ref<Fbo> pDstFbo;
+    ref<Texture> mpLastOutTex;
     std::unique_ptr<TextRenderer> mpTextRenderer;
 
     // Screen parameters

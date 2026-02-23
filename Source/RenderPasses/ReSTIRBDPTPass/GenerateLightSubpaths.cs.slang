@@ -297,10 +297,8 @@ bool ConnectToCamera(in LightSubpathVertex yj, inout SampleGenerator sg, out Pat
     ShadingData y_s1_sd = gScene.materials.prepareShadingData(y_s1_vd, yj.y_s1.materialID, yj.y_s1.dirIn);
     let y_s1_mi = gScene.materials.getMaterialInstance(y_s1_sd, ExplicitLodTextureSampler(0.f));
 
-    SceneRayQuery<0> rq;
-    Ray ray = Ray(yj.y_s1.posW, dirToCamera, 1e-4f, dist - 1e-4f);
-
-    if (!rq.traceVisibilityRay(ray))
+    float3 Tr = EvalTransmittance(yj.y_s1.posW, dirToCamera, dist - 1e-4f);
+    if (all(Tr == 0.0f))
         return false;
 
     bool isCaustic = (yj.numBounces > 0) && (yj.numVertices > 1);
@@ -313,7 +311,7 @@ bool ConnectToCamera(in LightSubpathVertex yj, inout SampleGenerator sg, out Pat
 
     float geometryFactor = cosThetaCam / distSq;
 
-    float3 pathF = yj.throughput * bsdf * geometryFactor;
+    float3 pathF = yj.throughput * bsdf * geometryFactor * Tr;
 
     r.pathF = pathF;
 

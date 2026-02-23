@@ -96,7 +96,14 @@ void ComparisonPass::execute(RenderContext* pRenderContext, const RenderData& re
     // Get references to our input, output, and temporary accumulation texture
     pLeftSrcTex = renderData.getTexture(kLeftInput);
     pRightSrcTex = renderData.getTexture(kRightInput);
-    pDstFbo = Fbo::create(mpDevice, {renderData.getTexture(kOutput)});
+
+    auto outTex = renderData.getTexture(kOutput);
+    if (!pDstFbo || outTex != mpLastOutTex)
+    {
+        pDstFbo = Fbo::create(mpDevice, { outTex });
+        mpLastOutTex = outTex;
+    }
+    auto dstFbo = pDstFbo;
 
     // If we haven't initialized the split location, split the screen in half by default
     if (mSplitLoc < 0)
@@ -111,6 +118,8 @@ void ComparisonPass::execute(RenderContext* pRenderContext, const RenderData& re
 
     // Execute the accumulation shader
     mpSplitShader->execute(pRenderContext, pDstFbo);
+
+    pRenderContext->resourceBarrier(outTex.get(), Resource::State::RenderTarget);
 
     // Render some labels
     if (mShowLabels)

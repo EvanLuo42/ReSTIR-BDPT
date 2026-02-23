@@ -315,9 +315,8 @@ bool ConnectToRandomLight(in CameraSubpathVertex xj, inout SampleGenerator sg, o
     if (cosThetaIn <= 0.0f)
         return false;
 
-    SceneRayQuery<0> rq;
-    Ray ray = Ray(xj.x.posW, dirToLight, 1e-4f, dist - 1e-4f);
-    if (!rq.traceVisibilityRay(ray))
+    float3 Tr = EvalTransmittance(xj.x.posW, dirToLight, dist - 1e-4f);
+    if (all(Tr == 0.0f))
         return false;
 
     TriangleHit currentHit;
@@ -347,8 +346,7 @@ bool ConnectToRandomLight(in CameraSubpathVertex xj, inout SampleGenerator sg, o
     r.confidenceWeight = 1.0f;
 
     float G = cosThetaIn / distSq;
-    float3 pathF = xj.throughput * bsdfWeight * G * Le;
-
+    float3 pathF = xj.throughput * bsdfWeight * G * Le * Tr;
     r.pathF = pathF;
 
     float pathRatio = float(gNumLightSubpaths) / float(gTargetDim.x * gTargetDim.y);
@@ -418,9 +416,8 @@ bool ConnectToRandomLVC(in CameraSubpathVertex xj, inout SampleGenerator sg, out
     float dist = sqrt(distSq);
     dirToLight /= dist;
 
-    SceneRayQuery<0> rq;
-    Ray ray = Ray(xj.x.posW, dirToLight, 1e-4f, dist - 1e-4f);
-    if (!rq.traceVisibilityRay(ray))
+    float3 Tr = EvalTransmittance(xj.x.posW, dirToLight, dist - 1e-4f);
+    if (all(Tr == 0.0f))
         return false;
 
     TriangleHit camHit;
@@ -465,7 +462,7 @@ bool ConnectToRandomLVC(in CameraSubpathVertex xj, inout SampleGenerator sg, out
 
     float G = 1.0f / distSq;
 
-    float3 pathF = xj.throughput * f_cam * G * f_light * yk.throughput;
+    float3 pathF = xj.throughput * f_cam * G * f_light * yk.throughput * Tr;
     r.pathF = pathF;
 
     r.UCW = (float)lvcSize / max((float)gNumLightSubpaths, 1.0f);

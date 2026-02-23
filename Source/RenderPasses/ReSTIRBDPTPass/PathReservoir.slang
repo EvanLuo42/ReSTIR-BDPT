@@ -188,7 +188,7 @@ struct PathReservoir
             this.cachedMisData = r.cachedMisData;
         }
     }
-    
+
     [mutating]
     void FinalizeResampling()
     {
@@ -220,4 +220,45 @@ void InitializeReservoir(bool isCaustic, out PathReservoir ri)
     ri.suffixPdf = 0.0f;
     ri.lightPathPdf = 0.0f;
     ri.bounces = 0;
+}
+
+float3 EvalTransmittance(float3 origin, float3 dir, float maxDist)
+{
+    float3 throughput = float3(1.0f);
+    Ray ray = Ray(origin, dir, 1e-4f, maxDist);
+
+    while (true)
+    {
+        SceneRayQuery<0> rq;
+        float hitT; 
+        HitInfo hit = rq.traceRay(ray, hitT);
+
+        if (!hit.isValid())
+            break;
+
+        TriangleHit triHit = hit.getTriangleHit();
+        VertexData v = gScene.getVertexData(triHit);
+        uint matID = gScene.getMaterialID(triHit.instanceID);
+
+        ShadingData sd = gScene.materials.prepareShadingData(v, matID, -dir);
+        let mi = gScene.materials.getMaterialInstance(sd, ExplicitLodTextureSampler(0.f));
+        BSDFProperties props = mi.getProperties(sd);
+
+        float3 transmission = props.specularTransmissionAlbedo;
+
+        if (all(transmission == 0.0f))
+        {
+            return float3(0.0f);
+        }
+
+        throughput *= transmission;
+
+        ray.origin = ray.origin + ray.dir * (hitT + 1e-4f);
+        ray.tMax -= hitT;
+
+        if (ray.tMax <= 0.0f)
+            break;
+    }
+
+    return throughput;
 }
