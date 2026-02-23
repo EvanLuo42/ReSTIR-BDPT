@@ -25,14 +25,14 @@ void main(uint3 tid: SV_DispatchThreadID)
 
     float3 finalColor = float3(0.0f, 0.0f, 0.0f);
 
-    if (r.UCW > 0.0f && r.misWeight > 0.0f)
+    if (r.UCW > 0.0f)
     {
-        finalColor += r.pathF * r.misWeight * r.UCW;
+        finalColor += r.pathF * r.UCW;
     }
 
-    if (c.UCW > 0.0f && c.misWeight > 0.0f)
+    if (c.UCW > 0.0f)
     {
-        finalColor += c.pathF * c.misWeight * c.UCW;
+        finalColor += c.pathF * c.UCW;
     }
 
     if (any(isnan(finalColor)) || any(isinf(finalColor)))

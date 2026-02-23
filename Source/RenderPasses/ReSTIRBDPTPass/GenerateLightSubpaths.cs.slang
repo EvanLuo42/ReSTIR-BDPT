@@ -43,9 +43,8 @@ void main(uint3 tid: SV_DispatchThreadID)
     for (int j = 1; j < gNumBounces; ++j)
     {
         bool rough = false;
-        bool terminate = false;
 
-        if (!TraceNewVertex(sg, yj, rough, terminate))
+        if (!TraceNewVertex(sg, yj, rough))
             break;
 
         if (rough)
@@ -58,9 +57,6 @@ void main(uint3 tid: SV_DispatchThreadID)
 
             gLRM.Insert(k, r);
         }
-
-        if (terminate)
-            break;
     }
 }
 
@@ -102,26 +98,22 @@ bool InitializeLightPath(inout SampleGenerator sg, uint subpathId, out LightSubp
     y.subpathSeed = jenkinsHash(subpathId ^ jenkinsHash(gFrameCount));
     y.subpathId = subpathId;
 
-    y.diffuseBounces = 1;
-
     y.numVertices = 1;
     y.numBounces = 0;
 
-    y.dVC = 1;
-    y.dp = 0;
+    y.dp = 0.0f;
+    y.dVC = 0.0f;
 
     return true;
 }
 
-bool TraceNewVertex(inout SampleGenerator sg, inout LightSubpathVertex yj, out bool rough, out bool terminate)
+bool TraceNewVertex(inout SampleGenerator sg, inout LightSubpathVertex yj, out bool rough)
 {
-    LightSubpathVertex y_j1 = yj;
-
-    if (yj.numBounces == 0)
+    if (yj.numVertices == 1)
     {
-        EmissiveTriangle tri = gScene.lightCollection.getTriangle(yj.y0.triangleIndex);
-        float3 lightPos = tri.getPosition(yj.y0.bary);
-        float3 lightNormal = tri.normal;
+        EmissiveTriangle lightTriangle = gScene.lightCollection.getTriangle(yj.y0.triangleIndex);
+        float3 lightPos = lightTriangle.getPosition(yj.y0.bary);
+        float3 lightNormal = lightTriangle.normal;
 
         float2 uDir = sampleNext2D(sg);
         float pdfSA;
@@ -142,36 +134,37 @@ bool TraceNewVertex(inout SampleGenerator sg, inout LightSubpathVertex yj, out b
         if (!hit.isValid())
             return false;
 
-        TriangleHit triHit = hit.getTriangleHit();
-        VertexData vd = gScene.getVertexData(triHit);
-        uint hitMaterialID = gScene.getMaterialID(triHit.instanceID);
-        ShadingData sdHit = gScene.materials.prepareShadingData(vd, hitMaterialID, -worldDir);
+        TriangleHit y_s1_hit = hit.getTriangleHit();
+        VertexData y_s1_vd = gScene.getVertexData(y_s1_hit);
+        uint y_s1_materialID = gScene.getMaterialID(y_s1_hit.instanceID);
+        ShadingData y_s1_sd = gScene.materials.prepareShadingData(y_s1_vd, y_s1_materialID, -worldDir);
 
-        let miHit = gScene.materials.getMaterialInstance(sdHit, ExplicitLodTextureSampler(0.f));
-        BSDFProperties hitProps = miHit.getProperties(sdHit);
-        float rgh = hitProps.roughness;
+        let y_s1_mi = gScene.materials.getMaterialInstance(y_s1_sd, ExplicitLodTextureSampler(0.f));
+        BSDFProperties y_s1_hitProps = y_s1_mi.getProperties(y_s1_sd);
+        float rgh = y_s1_hitProps.roughness;
 
-        rough = (rgh > gRoughnessThreshold);
+        BSDFSample y_s1_bsdfSample;
+        if (!y_s1_mi.sample(y_s1_sd, sg, y_s1_bsdfSample))
+            return false;
 
-        if (rough)
-            yj.diffuseBounces |= (1u << (yj.numBounces + 1));
+        rough = rgh > gRoughnessThreshold;
 
         PathVertex y_s1;
-        y_s1.instanceID = triHit.instanceID;
-        y_s1.materialID = gScene.getMaterialID(triHit.instanceID);
-        y_s1.posW = vd.posW;
-        y_s1.primitiveID = triHit.primitiveIndex;
+        y_s1.instanceID = y_s1_hit.instanceID;
+        y_s1.materialID = gScene.getMaterialID(y_s1_hit.instanceID);
+        y_s1.posW = y_s1_vd.posW;
+        y_s1.primitiveID = y_s1_hit.primitiveIndex;
         y_s1.dirIn = -ray.dir;
-        y_s1.barycentrics = triHit.barycentrics;
+        y_s1.barycentrics = y_s1_hit.barycentrics;
 
         yj.y_s1 = y_s1;
 
-        float2 uv = tri.getTexCoord(yj.y0.bary);
-        float3 Le = gScene.materials.evalEmissive(tri.materialID, uv);
+        float2 uv = lightTriangle.getTexCoord(yj.y0.bary);
+        float3 Le = gScene.materials.evalEmissive(lightTriangle.materialID, uv);
 
         yj.throughput = Le * (M_PI / yj.subpathPdf);
 
-        float cosThetaIn = abs(dot(vd.normalW, -worldDir));
+        float cosThetaIn = abs(dot(y_s1_vd.normalW, -worldDir));
         float cosThetaOut = abs(dot(lightNormal, worldDir));
         float distSq = max(hitT * hitT, 1e-7f);
         float pdfFwdArea = pdfSA * (cosThetaIn / distSq);
@@ -179,87 +172,87 @@ bool TraceNewVertex(inout SampleGenerator sg, inout LightSubpathVertex yj, out b
         float p0_trace = yj.subpathPdf;
         float p0_connect = yj.subpathPdf;
 
-        yj.dp = pow(p0_connect / (p0_trace * pdfFwdArea), gMISPower);
-        yj.dVC = pow((cosThetaOut / distSq) / (p0_trace * pdfFwdArea), gMISPower);
+        yj.dp = pow(1.0f / pdfFwdArea, gMISPower);
+        yj.dVC = pow((cosThetaOut / distSq) / pdfFwdArea, gMISPower);
 
         yj.subpathPdf *= pdfFwdArea;
     }
     else
     {
-        TriangleHit currentHit;
-        currentHit.instanceID = yj.y_s1.instanceID;
-        currentHit.primitiveIndex = yj.y_s1.primitiveID;
-        currentHit.barycentrics = yj.y_s1.barycentrics;
+        TriangleHit y_s2_hit;
+        y_s2_hit.instanceID = yj.y_s1.instanceID;
+        y_s2_hit.primitiveIndex = yj.y_s1.primitiveID;
+        y_s2_hit.barycentrics = yj.y_s1.barycentrics;
 
-        VertexData vCurrent = gScene.getVertexData(currentHit);
-        ShadingData sdCurrent = gScene.materials.prepareShadingData(vCurrent, yj.y_s1.materialID, yj.y_s1.dirIn);
-        let mi = gScene.materials.getMaterialInstance(sdCurrent, ExplicitLodTextureSampler(0.f));
+        VertexData y_s2_vd = gScene.getVertexData(y_s2_hit);
+        ShadingData y_s2_sd = gScene.materials.prepareShadingData(y_s2_vd, yj.y_s1.materialID, yj.y_s1.dirIn);
+        let y_s2_mi = gScene.materials.getMaterialInstance(y_s2_sd, ExplicitLodTextureSampler(0.f));
 
-        BSDFSample bsdfSample;
-        if (!mi.sample(sdCurrent, sg, bsdfSample))
+        BSDFSample y_s2_bsdfSample;
+        if (!y_s2_mi.sample(y_s2_sd, sg, y_s2_bsdfSample))
             return false;
 
         SceneRayQuery<0> rq;
-        Ray ray = Ray(sdCurrent.posW, bsdfSample.wo, 1e-4f, 10000.0f);
+        Ray ray = Ray(y_s2_sd.posW, y_s2_bsdfSample.wo, 1e-4f, 10000.0f);
         float hitT;
         HitInfo hit = rq.traceRay(ray, hitT);
 
         if (!hit.isValid())
             return false;
 
-        TriangleHit triHitNext = hit.getTriangleHit();
-        VertexData vNext = gScene.getVertexData(triHitNext);
-        uint nextMaterialID = gScene.getMaterialID(triHitNext.instanceID);
-        ShadingData sdNext = gScene.materials.prepareShadingData(vNext, nextMaterialID, -bsdfSample.wo);
+        TriangleHit y_s1_hit = hit.getTriangleHit();
+        VertexData y_s1_vd = gScene.getVertexData(y_s1_hit);
+        uint y_s1_materialID = gScene.getMaterialID(y_s1_hit.instanceID);
+        ShadingData y_s1_sd = gScene.materials.prepareShadingData(y_s1_vd, y_s1_materialID, -y_s2_bsdfSample.wo);
 
-        let miNext = gScene.materials.getMaterialInstance(sdNext, ExplicitLodTextureSampler(0.f));
+        let y_s1_mi = gScene.materials.getMaterialInstance(y_s1_sd, ExplicitLodTextureSampler(0.f));
 
-        BSDFProperties nextProps = miNext.getProperties(sdNext);
-        float rgh = nextProps.roughness;
-        float p_terminate = clamp(0.2f * rgh, 0.0f, 0.95f);
-        float p_survive = 1.0f - p_terminate;
+        BSDFProperties y_s1_hitProps = y_s1_mi.getProperties(y_s1_sd);
+        float rgh = y_s1_hitProps.roughness;
 
-        if (sampleNext1D(sg) < p_terminate)
-            terminate = true;
+        rough = rgh > gRoughnessThreshold;
 
-        float alpha = max(rgh * rgh, 1e-4f);
-        bool deltaLike = (alpha < gRoughnessThreshold);
-        rough = bsdfSample.isLobe(LobeType::NonDelta) && !deltaLike;
-
-        if (rough)
-            yj.diffuseBounces |= (1u << (yj.numBounces + 1));
-
-        uint nonDelta = bsdfSample.isLobe(LobeType::NonDelta) ? 1 : 0;
-
-        float cosThetaIn = abs(dot(vNext.normalW, -bsdfSample.wo));
         float distSq = max(hitT * hitT, 1e-7f);
-        float pdfFwdArea = bsdfSample.pdf * (cosThetaIn / distSq);
+        float cosNext = abs(dot(y_s1_sd.frame.N, -y_s2_bsdfSample.wo));
+        float pdfFwdArea = y_s2_bsdfSample.pdf * (cosNext / distSq);
 
-        float cosThetaPrev = abs(dot(sdCurrent.faceN, bsdfSample.wo));
-        float geomRev = cosThetaPrev / distSq;
+        float3 dirToPrev = normalize(y_s2_sd.posW - y_s1_sd.posW);
+        ShadingData sdNextReverse = gScene.materials.prepareShadingData(y_s1_vd, y_s1_materialID, -y_s2_bsdfSample.wo);
+        let miNextReverse = gScene.materials.getMaterialInstance(sdNextReverse, ExplicitLodTextureSampler(0.f));
+        float pdfRevSA = miNextReverse.evalPdf(sdNextReverse, dirToPrev);
 
-        ShadingData sdRev = gScene.materials.prepareShadingData(vCurrent, yj.y_s1.materialID, -bsdfSample.wo);
-        let miRev = gScene.materials.getMaterialInstance(sdRev, ExplicitLodTextureSampler(0.f));
-        float p_rev_sigma = miRev.evalPdf(sdRev, yj.y_s1.dirIn);
+        float old_dp = yj.dp;
+        float old_dVC = yj.dVC;
 
-        float dp_new = nonDelta * pow(1.0f / pdfFwdArea, gMISPower);
-        float dVC_new = pow(geomRev / pdfFwdArea, gMISPower) * (nonDelta * yj.dp + pow(p_rev_sigma, gMISPower) * yj.dVC);
+        float invPdfFwdAreaPow = pow(1.0f / max(pdfFwdArea, 1e-30f), gMISPower);
+        float pdfRevSAPow = pow(max(pdfRevSA, 0.0f), gMISPower);
 
-        yj.dVC = dVC_new;
-        yj.dp = dp_new;
+        if (y_s2_bsdfSample.isLobe(LobeType::Delta))
+        {
+            yj.dp = old_dp;
+            yj.dVC = old_dVC;
+        }
+        else
+        {
+            float invPdfFwdAreaPow = pow(1.0f / max(pdfFwdArea, 1e-30f), gMISPower);
+            float pdfRevSAPow = pow(max(pdfRevSA, 0.0f), gMISPower);
 
-        yj.throughput = (yj.throughput * bsdfSample.weight) / p_survive;
-        yj.subpathPdf *= (pdfFwdArea * p_survive);
+            yj.dp = invPdfFwdAreaPow;
+            yj.dVC = invPdfFwdAreaPow * (old_dp + pdfRevSAPow * old_dVC);
+        }
 
-        yj.y_s1.instanceID = triHitNext.instanceID;
-        yj.y_s1.materialID = nextMaterialID;
-        yj.y_s1.posW = sdNext.posW;
-        yj.y_s1.primitiveID = triHitNext.primitiveIndex;
+        yj.throughput *= y_s2_bsdfSample.weight;
+        yj.subpathPdf *= pdfFwdArea;
+
+        yj.y_s1.instanceID = y_s1_hit.instanceID;
+        yj.y_s1.materialID = y_s1_materialID;
+        yj.y_s1.posW = y_s1_sd.posW;
+        yj.y_s1.primitiveID = y_s1_hit.primitiveIndex;
         yj.y_s1.dirIn = -ray.dir;
-        yj.y_s1.barycentrics = triHitNext.barycentrics;
+        yj.y_s1.barycentrics = y_s1_hit.barycentrics;
     }
 
-    yj.numBounces++;
+    yj.numBounces += (uint16_t)(rough ? 1 : 0);
     yj.numVertices++;
     return true;
 }
@@ -293,22 +286,14 @@ bool ConnectToCamera(in LightSubpathVertex yj, inout SampleGenerator sg, out Pat
 
     k = pixelCoord.y * gTargetDim.x + pixelCoord.x;
 
-    TriangleHit currentHit;
-    currentHit.instanceID = yj.y_s1.instanceID;
-    currentHit.primitiveIndex = yj.y_s1.primitiveID;
-    currentHit.barycentrics = yj.y_s1.barycentrics;
-    VertexData vCurrent = gScene.getVertexData(currentHit);
+    TriangleHit y_s1_hit;
+    y_s1_hit.instanceID = yj.y_s1.instanceID;
+    y_s1_hit.primitiveIndex = yj.y_s1.primitiveID;
+    y_s1_hit.barycentrics = yj.y_s1.barycentrics;
+    VertexData y_s1_vd = gScene.getVertexData(y_s1_hit);
 
-    ShadingData sdCurrent = gScene.materials.prepareShadingData(vCurrent, yj.y_s1.materialID, yj.y_s1.dirIn);
-    let mi = gScene.materials.getMaterialInstance(sdCurrent, ExplicitLodTextureSampler(0.f));
-
-    float3 bsdfWeight = mi.eval(sdCurrent, dirToCamera, sg);
-    if (all(bsdfWeight == 0.0f))
-        return false;
-
-    ShadingData sdReverse = gScene.materials.prepareShadingData(vCurrent, yj.y_s1.materialID, dirToCamera);
-    let miReverse = gScene.materials.getMaterialInstance(sdReverse, ExplicitLodTextureSampler(0.f));
-    float pdfRevSA = miReverse.evalPdf(sdReverse, yj.y_s1.dirIn);
+    ShadingData y_s1_sd = gScene.materials.prepareShadingData(y_s1_vd, yj.y_s1.materialID, yj.y_s1.dirIn);
+    let y_s1_mi = gScene.materials.getMaterialInstance(y_s1_sd, ExplicitLodTextureSampler(0.f));
 
     SceneRayQuery<0> rq;
     Ray ray = Ray(yj.y_s1.posW, dirToCamera, 1e-4f, dist - 1e-4f);
@@ -316,85 +301,78 @@ bool ConnectToCamera(in LightSubpathVertex yj, inout SampleGenerator sg, out Pat
     if (!rq.traceVisibilityRay(ray))
         return false;
 
+    bool isCaustic = (yj.numBounces > 0) && (yj.numVertices > 1);
+    InitializeReservoir(isCaustic, r);
+
+    float3 bsdf = y_s1_mi.eval(y_s1_sd, dirToCamera, sg);
+
+    float cosThetaOut = abs(dot(y_s1_sd.frame.N, dirToCamera));
     float cosThetaCam = dot(normalize(gScene.camera.data.cameraW), -dirToCamera);
-    if (cosThetaCam <= 0.0f)
-        return false;
 
-    float cosThetaCam4 = cosThetaCam * cosThetaCam * cosThetaCam * cosThetaCam;
-    float cameraImportance = 1.0f;
+    float geometryFactor = (cosThetaOut * cosThetaCam) / distSq;
 
-    float geometryFactor = cosThetaCam / distSq;
-    float3 unweightedContribution = yj.throughput * bsdfWeight * geometryFactor * cameraImportance;
-    if (all(unweightedContribution == 0.0f))
-        return false;
+    float3 pathF = yj.throughput * bsdf * geometryFactor;
 
-    float cosThetaOut = abs(dot(sdCurrent.frame.N, dirToCamera));
-
-    float p_revArea = pdfRevSA * (cosThetaCam / distSq);
+    r.pathF = pathF;
 
     float halfWidth = length(gScene.camera.data.cameraU);
     float halfHeight = length(gScene.camera.data.cameraV);
     float imagePlaneArea = 4.0f * halfWidth * halfHeight;
 
-    float cosThetaCam3 = cosThetaCam * cosThetaCam * cosThetaCam;
-    float p_camSA = 1.0f / (imagePlaneArea * cosThetaCam3);
-
+    float p_camSA = 1.0f / (imagePlaneArea * pow(cosThetaCam, 3.0f));
     float p_camArea = p_camSA * (cosThetaOut / distSq);
 
-    float numCameraSubpaths = gTargetDim.x * gTargetDim.y;
-    float pathRatio = numCameraSubpaths / (float)gNumLightSubpaths;
+    ShadingData sdReverse = gScene.materials.prepareShadingData(y_s1_vd, yj.y_s1.materialID, dirToCamera);
+    let miReverse = gScene.materials.getMaterialInstance(sdReverse, ExplicitLodTextureSampler(0.f));
+    float pdfRevSA = miReverse.evalPdf(sdReverse, yj.y_s1.dirIn);
+    float p_revArea = pdfRevSA * (cosThetaCam / distSq);
 
-    float prefixFraction = pow(p_camArea * pathRatio, gMISPower);
-    float w_light = prefixFraction * (yj.dp + pow(pdfRevSA, gMISPower) * yj.dVC);
-    float misWeight = 1.0f / (w_light + 1.0f);
+    float pathRatio = (gTargetDim.x * gTargetDim.y) / float(gNumLightSubpaths);
 
-    bool isCaustic = false;
-    if (yj.numBounces >= 2)
-    {
-        bool isPrevRough = (yj.diffuseBounces & (1u << (yj.numBounces - 1))) != 0;
-        isCaustic = !isPrevRough;
-    }
+    float prefix = pow(p_camArea * pathRatio, gMISPower);
+    float w_light = prefix * (yj.dp + pow(pdfRevSA, gMISPower) * yj.dVC);
+    float misWeight = 1.0f / (1.0f + w_light);
 
-    InitializeReservoir(isCaustic, r);
+    r.misWeight = misWeight;
 
     r.UCW = 1.0f;
 
     r.confidenceWeight = 1.0f;
 
-    r.pathF = unweightedContribution;
-    r.misWeight = misWeight;
+    r.cameraSubpathSeed = 0;
+    r.cameraSubpathId = 0;
 
-    r.bounces = yj.numBounces + 1;
+    r.bounces = yj.numVertices - 1;
 
     r.prefixBounces = 0;
-
     r.prefixDiffuseBounces = 0;
 
-    r.xr = yj.y_s1;
-    r.y0 = yj.y0;
-    r.dirOut = dirToCamera;
-    r.reconnectionCos = cosThetaOut;
-    r.reconnectionDist = dist;
+    r.flags.setCaustic(isCaustic);
 
-    r.flags.IsCaustic = isCaustic;
+    r.prefixPdf = 1.0f;
+
+    r.xr = yj.y_s1;
+
+    r.suffixF = float3(0.0f);
+    r.suffixPdf = 0.0f;
+
+    r.reconnectionCos = cosThetaOut;
+    r.reconnectionDist = sqrt(distSq);
+
+    r.dirOut = dirToCamera;
+    r.y0 = yj.y0;
 
     r.lightPathSeed = yj.subpathSeed;
     r.lightPathId = yj.subpathId;
     r.lightPathPdf = yj.subpathPdf;
     r.lightPathVertices = yj.numVertices;
-    r.lightPathDiffuseBounces = countbits(yj.diffuseBounces);
-
-    r.cameraSubpathSeed = 0;
-    r.cameraSubpathId = 0;
-    r.prefixPdf = 1.0f;
-    r.suffixF = float3(0.0f);
-    r.suffixPdf = 0.0f;
+    r.lightPathDiffuseBounces = yj.numBounces;
 
     MisEvalData misData = {};
 
     misData.d_p_light = yj.dp;
     misData.d_vc_light = yj.dVC;
-    misData.p_rev_light = p_revArea;
+    misData.p_rev_light = pdfRevSA * (cosThetaCam / distSq);
 
     misData.p_rev_sigma_light = pdfRevSA;
 

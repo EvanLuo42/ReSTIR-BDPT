@@ -33,8 +33,6 @@ struct LightSubpathVertex
     uint subpathSeed;
     uint subpathId;
 
-    uint diffuseBounces;
-
     uint16_t numVertices;
     uint16_t numBounces;
 
@@ -76,16 +74,13 @@ struct CameraSubpathVertex
 {
     PathVertex x;
 
-    float3 throughput;   // Accumulated path throughput
-    uint bounces;        // Current depth/bounce count
-    uint diffuseBounces; // Number of rough/diffuse bounces encountered
-    float pathPdf;
+    float3 throughput;
+    uint16_t numVertices;
+    uint16_t numBounces;
+    float subpathPdf;
 
     float dVC; // $$d_i^{VC}$$
     float dp;  // $$d_i^p$$
-
-    float pdfFwd;      // Forward area-measure PDF: $$\vec{p}_i$$
-    float pdfRevSigma; // Reverse solid-angle PDF: $$\overleftarrow{p}_i^\sigma$$
 
     float gamma;     // $$\vec{\gamma}$$
     float lambda_vc; // $$\overleftarrow{\lambda}^{VC}$$
@@ -99,19 +94,16 @@ struct PathReservoirFlags
 
     static const uint CAUSTIC = 1u << 0;
 
-    property bool IsCaustic
-    {
-        get {
-            return (flags & CAUSTIC) != 0;
-        }
+    bool isCaustic() { return (flags & CAUSTIC) != 0; }
 
-        set {
-            if (newValue)
-                flags |= CAUSTIC;
-            else
-                flags &= ~CAUSTIC;
-        }
-    };
+    [mutating]
+    void setCaustic(bool v)
+    {
+        if (v)
+            flags |= CAUSTIC;
+        else
+            flags &= ~CAUSTIC;
+    }
 };
 
 struct PathReservoir
@@ -196,7 +188,7 @@ struct PathReservoir
             this.cachedMisData = r.cachedMisData;
         }
     }
-
+    
     [mutating]
     void FinalizeResampling()
     {
@@ -220,7 +212,7 @@ void InitializeReservoir(bool isCaustic, out PathReservoir ri)
     ri.confidenceWeight = 1.0f;
 
     ri.flags.flags = 0u;
-    ri.flags.IsCaustic = isCaustic;
+    ri.flags.setCaustic(isCaustic);
 
     ri.pathF = float3(0.0f, 0.0f, 0.0f);
     ri.misWeight = 0.0f;
