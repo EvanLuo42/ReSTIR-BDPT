@@ -178,6 +178,7 @@ bool TraceNewVertex(
         pdfSA = bsdfSample.pdf;
         bsdfWeight = bsdfSample.weight;
         isNonDelta = !bsdfSample.isLobe(LobeType::Delta);
+
         cosThetaOut = abs(dot(sdCurrent.frame.N, bsdfSample.wo));
     }
 
@@ -204,7 +205,7 @@ bool TraceNewVertex(
     emissive = any(Le > 0.0f);
 
     float cosThetaIn = abs(dot(sdNext.frame.N, -ray.dir));
-    float distSq = max(hitT * hitT, 1e-7f);
+    float distSq = max(hitT * hitT, 1e-4f);
 
     float G = (cosThetaOut * cosThetaIn) / distSq;
     float pdfFwdArea = pdfSA * (cosThetaIn / distSq);
@@ -225,7 +226,8 @@ bool TraceNewVertex(
     {
         float invPdfFwdArea = 1.0f / max(pdfFwdArea, 1e-10f);
 
-        xj.dp = pow(float(gNumLightSubpaths) / pdfFwdArea, gMISPower);
+        // xj.dp = pow(float(gNumLightSubpaths) / pdfFwdArea, gMISPower);
+        xj.dp = 0.0f;
         xj.dVC = 0.0f;
 
         xj.gamma = 0.0f;
@@ -341,11 +343,10 @@ bool ConnectToRandomLight(in CameraSubpathVertex xj, inout SampleGenerator sg, o
 
     InitializeReservoir(false, r);
 
-    r.UCW = 1.0f;
+    r.UCW = 1.0f / max(pdfLightArea, 1e-10f);
     r.confidenceWeight = 1.0f;
 
-    float cosThetaOut = abs(dot(sdCurrent.frame.N, dirToLight));
-    float G = (cosThetaOut * cosThetaIn) / distSq;
+    float G = cosThetaIn / distSq;
     float3 pathF = xj.throughput * bsdfWeight * G * Le;
 
     r.pathF = pathF;
@@ -450,6 +451,10 @@ bool ConnectToRandomLVC(in CameraSubpathVertex xj, inout SampleGenerator sg, out
     ShadingData sdLight = gScene.materials.prepareShadingData(vLight, yk.y_s1.materialID, yk.y_s1.dirIn);
     let miLight = gScene.materials.getMaterialInstance(sdLight, ExplicitLodTextureSampler(0.f));
 
+    float3 f_light = miLight.eval(sdLight, -dirToLight, sg);
+    if (all(f_light == 0.0f))
+        return false;
+
     InitializeReservoir(false, r);
 
     r.confidenceWeight = 1.0f;
@@ -458,13 +463,12 @@ bool ConnectToRandomLVC(in CameraSubpathVertex xj, inout SampleGenerator sg, out
 
     float cosThetaLight = abs(dot(sdLight.frame.N, -dirToLight));
 
-    float G = (cosThetaCam * cosThetaLight) / distSq;
+    float G = 1.0f / distSq;
 
-    float3 pathF = xj.throughput * f_cam * G * yk.throughput;
-
+    float3 pathF = xj.throughput * f_cam * G * f_light * yk.throughput;
     r.pathF = pathF;
 
-    r.UCW = 1.0f;
+    r.UCW = (float)lvcSize / max((float)gNumLightSubpaths, 1.0f);
 
     float pdfRevSA_light = miLight.evalPdf(sdLight, -dirToLight);
     float p_rev_light = pdfRevSA_light * (cosThetaCam / distSq);

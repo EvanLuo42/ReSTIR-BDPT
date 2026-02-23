@@ -165,6 +165,9 @@ bool TraceNewVertex(inout SampleGenerator sg, inout LightSubpathVertex yj, out b
         yj.throughput = Le * (M_PI / yj.subpathPdf);
 
         float cosThetaIn = abs(dot(y_s1_vd.normalW, -worldDir));
+        // float cosThetaOut = dot(lightNormal, worldDir);
+        // if (cosThetaOut <= 0.0f)
+        //     return false;
         float cosThetaOut = abs(dot(lightNormal, worldDir));
         float distSq = max(hitT * hitT, 1e-7f);
         float pdfFwdArea = pdfSA * (cosThetaIn / distSq);
@@ -240,7 +243,6 @@ bool TraceNewVertex(inout SampleGenerator sg, inout LightSubpathVertex yj, out b
             yj.dp = invPdfFwdAreaPow;
             yj.dVC = invPdfFwdAreaPow * (old_dp + pdfRevSAPow * old_dVC);
         }
-
         yj.throughput *= y_s2_bsdfSample.weight;
         yj.subpathPdf *= pdfFwdArea;
 
@@ -309,7 +311,7 @@ bool ConnectToCamera(in LightSubpathVertex yj, inout SampleGenerator sg, out Pat
     float cosThetaOut = abs(dot(y_s1_sd.frame.N, dirToCamera));
     float cosThetaCam = dot(normalize(gScene.camera.data.cameraW), -dirToCamera);
 
-    float geometryFactor = (cosThetaOut * cosThetaCam) / distSq;
+    float geometryFactor = cosThetaCam / distSq;
 
     float3 pathF = yj.throughput * bsdf * geometryFactor;
 
